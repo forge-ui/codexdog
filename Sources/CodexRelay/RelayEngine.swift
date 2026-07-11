@@ -1,0 +1,783 @@
+import Foundation
+import AppKit
+import Darwin
+
+protocol AppServerServing: AnyObject, Sendable {
+    func stop(timeout: TimeInterval)
+    func rateLimits() throws -> RateLimitSnapshot
+    func listThreads(limit: Int) throws -> [ThreadRecord]
+    func unfinishedThreads(from threads: [ThreadRecord], recentHours: Int, now: Date) -> [ThreadRecord]
+    func recoveryMarkerStatus(_ entry: RecoveryEntry) throws -> RecoveryMarkerStatus
+    func resumeAndWake(_ entry: RecoveryEntry) throws
+    func waitForTurns(_ threadIDs: Set<String>, timeoutSeconds: Int) -> Set<String>
+}
+
+extension AppServerServing {
+    func stop() { stop(timeout: 2) }
+    func unfinishedThreads(from threads: [ThreadRecord], recentHours: Int) -> [ThreadRecord] {
+        unfinishedThreads(from: threads, recentHours: recentHours, now: Date())
+    }
+}
+
+extension AppServerClient: AppServerServing {}
+
+protocol ChatGPTControlling: AnyObject {
+    func quit() throws
+    func openIfNeeded(path: String) throws
+}
+
+struct ProfileRotation {
+    static func candidates(profiles: [String], current: String) -> [String] {
+        guard !profiles.isEmpty else { return [] }
+        guard let currentIndex = profiles.firstIndex(of: current) else { return profiles }
+        guard profiles.count > 1 else { return [] }
+        return (1..<profiles.count).map { profiles[(currentIndex + $0) % profiles.count] }
+    }
+}
+
+struct RecoverySelector {
+    static func select(_ threads: [ThreadRecord], now: Date, recentHours: Int, maxCount: Int, completedKeys: Set<String>, switchID: UUID) -> [RecoveryEntry] {
+        let cutoff = Int64(now.addingTimeInterval(TimeInterval(-recentHours * 3600)).timeIntervalSince1970)
+        return threads.filter { thread in
+            thread.status == "active" || thread.status == "systemError" || (thread.updatedAt ?? 0) >= cutoff
+        }.prefix(maxCount).compactMap { thread in
+            let key = "codex-relay-\(switchID.uuidString.lowercased())-\(thread.id)"
+            guard !completedKeys.contains(key) else { return nil }
+            return RecoveryEntry(threadId: thread.id, cwd: thread.cwd, previousStatus: thread.status, recoveryKey: key)
+        }
+    }
+}
+
+final class ChatGPTController: ChatGPTControlling, @unchecked Sendable {
+    func quit() throws {
+        let bundleIdentifier = "com.openai.codex"
+        let timeout: TimeInterval = 15
+        let gracefulDeadline = Date().addingTimeInterval(timeout * 0.7)
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).forEach { $0.terminate() }
+        while Date() < gracefulDeadline {
+            if !isRunning(bundleIdentifier: bundleIdentifier) { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).forEach { $0.forceTerminate() }
+        let forcedDeadline = Date().addingTimeInterval(timeout * 0.3)
+        while Date() < forcedDeadline {
+            if !isRunning(bundleIdentifier: bundleIdentifier) { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        throw RelayError.process("ChatGPT did not quit within \(Int(timeout)) seconds")
+    }
+
+    func open(path: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", path]
+        try process.run(); process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw RelayError.process("Failed to open \(path)") }
+    }
+
+    func openIfNeeded(path: String) throws {
+        let bundleIdentifier = "com.openai.codex"
+        guard !isRunning(bundleIdentifier: bundleIdentifier) else { return }
+        try open(path: path)
+    }
+
+    private func isRunning(bundleIdentifier: String) -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty
+    }
+}
+
+final class RelayEngine: @unchecked Sendable {
+    let storage: RelayStorage
+    let config: RelayConfig
+    let appController: any ChatGPTControlling
+    private let appServerFactory: (URL) throws -> any AppServerServing
+    private let recoveryHostsLock = NSLock()
+    private var recoveryHosts: [UUID: any AppServerServing] = [:]
+
+    init(
+        storage: RelayStorage,
+        config: RelayConfig,
+        appController: any ChatGPTControlling = ChatGPTController(),
+        appServerFactory: ((URL) throws -> any AppServerServing)? = nil)
+    {
+        self.storage = storage
+        self.config = config
+        self.appController = appController
+        self.appServerFactory = appServerFactory ?? { codexHome in
+            try AppServerClient(binaryPath: config.codexBinaryPath, codexHome: codexHome)
+        }
+    }
+
+    private func makeAppServer(codexHome: URL) throws -> any AppServerServing {
+        try appServerFactory(codexHome)
+    }
+
+    deinit {
+        stopRecoveryHosts()
+    }
+
+    func diagnose() throws -> String {
+        let server = try makeAppServer(codexHome: storage.paths.codexHome)
+        defer { server.stop() }
+        fputs("diagnose: rate limits\n", stderr)
+        let limits = try server.rateLimits()
+        if let active = storage.detectActiveProfile(in: config.profiles) {
+            try storage.saveCurrentAuth(as: active)
+        }
+        fputs("diagnose: thread list\n", stderr)
+        let listed = try server.listThreads(limit: max(config.maxThreadsToWake * 2, 20))
+        fputs("diagnose: unfinished classification\n", stderr)
+        let unfinished = server.unfinishedThreads(from: listed, recentHours: config.recoveryRecentHours)
+        return "app-server=ok plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a") listedThreads=\(listed.count) recoverableThreads=\(unfinished.count)"
+    }
+
+    func checkOnce(force: Bool = false) throws -> String {
+        var state = try storage.loadState()
+        let detected = storage.detectActiveProfile(in: config.profiles)
+        if let reconciled = try reconcileInterruptedSwitch(state: &state, detectedProfile: detected) {
+            return reconciled
+        }
+        if detected != state.activeProfile {
+            state.activeProfile = detected
+            try storage.saveState(state)
+        }
+        guard !config.profiles.isEmpty else {
+            return "No managed profiles"
+        }
+        let server = try makeAppServer(codexHome: storage.paths.codexHome)
+        defer { server.stop() }
+        var limits: RateLimitSnapshot?
+        var activeAuthenticationError: Error?
+        do {
+            let currentLimits = try server.rateLimits()
+            guard currentLimits.hasOfficialLimitSignal else {
+                throw RelayError.rpc("Missing official rate limit windows")
+            }
+            limits = currentLimits
+            if let active = state.activeProfile {
+                try storage.saveCurrentAuth(as: active)
+                try storage.updateAccountQuota(quotaStatus(profile: active, limits: currentLimits))
+            }
+        } catch {
+            if let active = state.activeProfile {
+                _ = try? storage.saveCurrentAuth(as: active)
+            }
+            if isAuthenticationFailure(error) {
+                activeAuthenticationError = error
+                if let active = state.activeProfile {
+                    try? storage.updateAccountQuota(AccountQuotaStatus(
+                        profile: active, updatedAt: Date(), primary: nil, secondary: nil,
+                        planType: nil, error: error.localizedDescription))
+                }
+            } else {
+                throw error
+            }
+        }
+        let summary: String
+        if let limits {
+            summary = "primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a") plan=\(limits.planType ?? "unknown")"
+        } else {
+            summary = "authentication failed: \(activeAuthenticationError?.localizedDescription ?? "unknown error")"
+        }
+        try? refreshNextStandbyQuota(state: &state, activeProfile: state.activeProfile)
+        try storage.saveRuntime(RelayRuntimeStatus(
+            updatedAt: Date(), activeProfile: state.activeProfile,
+            primaryUsedPercent: limits?.primary?.usedPercent,
+            secondaryUsedPercent: limits?.secondary?.usedPercent,
+            planType: limits?.planType, message: summary
+        ))
+        let exhausted = force
+            || activeAuthenticationError != nil
+            || limits?.isExhausted(threshold: config.thresholdUsedPercent) == true
+        if !exhausted, state.lastError != nil, state.pendingSwitch == nil {
+            state.lastError = nil
+            try storage.saveState(state)
+        }
+        guard exhausted else {
+            if state.pendingSwitch != nil {
+                server.stop()
+                let recovery = try submitPendingRecovery(state: &state)
+                return "Within allowance: \(summary); \(recovery)"
+            }
+            return "Within allowance: \(summary)"
+        }
+        if config.dryRun && !force { return "Automatic switching is disabled: \(summary)" }
+        let current = state.activeProfile
+        let sourceProfile = current ?? "unmanaged"
+        let candidates = ProfileRotation.candidates(profiles: config.scheduledProfiles, current: sourceProfile)
+        var target: (profile: String, accountID: String)?
+        var failures: [String] = []
+        for candidate in candidates where storage.profileExists(candidate) {
+            if let current, storage.sameAccount(current, candidate) {
+                failures.append("\(candidate)=same account as \(current)")
+                continue
+            }
+            var probe: (any AppServerServing)?
+            do {
+                let profileHome = try storage.prepareProfileHome(candidate)
+                let client = try makeAppServer(codexHome: profileHome)
+                probe = client
+                let candidateLimits = try client.rateLimits()
+                guard candidateLimits.hasOfficialLimitSignal else {
+                    throw RelayError.rpc("Missing official rate limit windows")
+                }
+                try storage.updateAccountQuota(quotaStatus(profile: candidate, limits: candidateLimits))
+                client.stop()
+                probe = nil
+                if candidateLimits.isExhausted(threshold: config.thresholdUsedPercent) {
+                    failures.append("\(candidate)=exhausted")
+                    continue
+                }
+                target = (candidate, try storage.profileAccountID(candidate))
+                break
+            } catch {
+                probe?.stop()
+                try? storage.updateAccountQuota(AccountQuotaStatus(
+                    profile: candidate, updatedAt: Date(), primary: nil, secondary: nil,
+                    planType: nil, error: error.localizedDescription
+                ))
+                failures.append("\(candidate)=\(error.localizedDescription)")
+            }
+        }
+        guard let target else {
+            let detail = failures.isEmpty ? "no saved standby profiles" : failures.joined(separator: "; ")
+            throw RelayError.verification("No usable standby profile: \(detail)")
+        }
+        let listedThreads = try server.listThreads(limit: max(config.maxThreadsToWake * 2, 20))
+        let scannedThreads = server.unfinishedThreads(from: listedThreads, recentHours: config.recoveryRecentHours)
+        let failedRecoveryKeys = state.failedRecoveryKeys ?? []
+        let carriedRecovery = state.pendingSwitch?.snapshot.threads.filter {
+            !state.completedRecoveryKeys.contains($0.recoveryKey)
+                && !failedRecoveryKeys.contains($0.recoveryKey)
+        } ?? []
+        let carriedThreadIDs = Set(carriedRecovery.map(\.threadId))
+        let switchID = UUID()
+        let remainingCapacity = max(config.maxThreadsToWake - carriedRecovery.count, 0)
+        let newlySelected = RecoverySelector.select(
+            scannedThreads.filter { !carriedThreadIDs.contains($0.id) },
+            now: Date(), recentHours: config.recoveryRecentHours,
+            maxCount: remainingCapacity,
+            completedKeys: state.completedRecoveryKeys, switchID: switchID)
+        let recovery = Array(carriedRecovery.prefix(config.maxThreadsToWake)) + newlySelected
+        let snapshot = SwitchSnapshot(
+            id: switchID, createdAt: Date(), sourceProfile: sourceProfile,
+            targetProfile: target.profile, threads: recovery)
+        let previousAuth: Data
+        let sourceAccountID: String?
+        if let current {
+            previousAuth = try storage.saveCurrentAuth(as: current)
+            sourceAccountID = try storage.profileAccountID(current)
+        } else {
+            previousAuth = try Data(contentsOf: storage.paths.activeAuth)
+            sourceAccountID = try? storage.activeAccountID()
+        }
+        try storage.prepareSwitchBackup(id: switchID, authData: previousAuth)
+        let previousTransactionID = state.pendingSwitch?.snapshot.id
+        state.lastSnapshot = snapshot
+        state.pendingSwitch = SwitchTransaction(
+            snapshot: snapshot, phase: .prepared,
+            sourceAccountID: sourceAccountID, targetAccountID: target.accountID,
+            previousLastSwitchAt: state.lastSwitchAt)
+        try storage.saveState(state)
+        if let previousTransactionID, previousTransactionID != switchID {
+            storage.removeSwitchBackup(id: previousTransactionID)
+        }
+        server.stop()
+        return try activatePreparedSwitch(state: &state)
+    }
+
+    private func reconcileInterruptedSwitch(state: inout RelayState, detectedProfile: String?) throws -> String? {
+        guard var transaction = state.pendingSwitch else { return nil }
+        let activeAccountID = try? storage.activeAccountID()
+
+        switch transaction.phase {
+        case .prepared:
+            guard !config.dryRun,
+                  config.isProfileScheduled(transaction.snapshot.targetProfile),
+                  storage.profileExists(transaction.snapshot.targetProfile) else {
+                return try rollbackPendingSwitch(state: &state, reason: "Prepared switch is no longer allowed")
+            }
+            if activeAccountID == transaction.targetAccountID {
+                transaction.phase = .activated
+                state.pendingSwitch = transaction
+                try storage.saveState(state)
+                return try validateActivatedSwitch(state: &state)
+            }
+            if activeAccountID == transaction.sourceAccountID
+                || (transaction.sourceAccountID == nil && detectedProfile == nil) {
+                return try activatePreparedSwitch(state: &state)
+            }
+            transaction.phase = .completed
+            state.pendingSwitch = transaction
+            state.activeProfile = detectedProfile
+            state.lastError = "Cancelled prepared switch because the active account changed externally"
+            try storage.saveState(state)
+            return try finalizeCompletedSwitch(state: &state, prefix: "Cancelled interrupted switch")
+
+        case .activated:
+            guard !config.dryRun,
+                  config.isProfileScheduled(transaction.snapshot.targetProfile),
+                  storage.profileExists(transaction.snapshot.targetProfile) else {
+                return try rollbackPendingSwitch(state: &state, reason: "Activated switch is no longer allowed")
+            }
+            if activeAccountID == transaction.targetAccountID {
+                return try validateActivatedSwitch(state: &state)
+            }
+            if activeAccountID == transaction.sourceAccountID {
+                transaction.phase = .completed
+                state.pendingSwitch = transaction
+                state.activeProfile = transaction.snapshot.sourceProfile == "unmanaged"
+                    ? detectedProfile : transaction.snapshot.sourceProfile
+                state.lastSwitchAt = transaction.previousLastSwitchAt
+                state.lastError = "Recovered a switch that had already rolled back"
+                try storage.saveState(state)
+                return try finalizeCompletedSwitch(state: &state, prefix: "Recovered rolled-back switch")
+            }
+            if activeAccountID != nil {
+                transaction.phase = .completed
+                state.pendingSwitch = transaction
+                state.activeProfile = detectedProfile
+                state.lastError = "Cancelled interrupted switch because the active account changed externally"
+                try storage.saveState(state)
+                return try finalizeCompletedSwitch(state: &state, prefix: "Cancelled interrupted switch")
+            }
+            return try rollbackPendingSwitch(state: &state, reason: "Activated target identity could not be verified")
+
+        case .validated, .recovering:
+            guard config.isProfileScheduled(transaction.snapshot.targetProfile) else {
+                transaction.phase = .completed
+                state.pendingSwitch = transaction
+                state.lastError = "Stopped recovery because target scheduling was disabled"
+                try storage.saveState(state)
+                return try finalizeCompletedSwitch(state: &state, prefix: "Stopped disabled recovery")
+            }
+            guard activeAccountID == transaction.targetAccountID else {
+                transaction.phase = .completed
+                state.pendingSwitch = transaction
+                state.activeProfile = detectedProfile
+                state.lastError = "Recovery stopped because the active account changed externally"
+                try storage.saveState(state)
+                return try finalizeCompletedSwitch(state: &state, prefix: "Stopped stale recovery")
+            }
+            return nil
+
+        case .completed:
+            return try finalizeCompletedSwitch(state: &state, prefix: "Reconciled completed switch")
+        }
+    }
+
+    private func activatePreparedSwitch(state: inout RelayState) throws -> String {
+        guard var transaction = state.pendingSwitch, transaction.phase == .prepared else {
+            throw RelayError.verification("Missing prepared switch transaction")
+        }
+        do {
+            stopRecoveryHosts()
+            try appController.quit()
+
+            let finalSourceAuth: Data
+            if transaction.snapshot.sourceProfile != "unmanaged",
+               storage.profileExists(transaction.snapshot.sourceProfile) {
+                finalSourceAuth = try storage.saveCurrentAuth(as: transaction.snapshot.sourceProfile)
+                if let expected = transaction.sourceAccountID {
+                    try storage.assertActiveAccount(expectedAccountID: expected)
+                }
+            } else {
+                finalSourceAuth = try Data(contentsOf: storage.paths.activeAuth)
+                if let expected = transaction.sourceAccountID {
+                    try storage.assertActiveAccount(expectedAccountID: expected)
+                }
+            }
+            try storage.prepareSwitchBackup(id: transaction.snapshot.id, authData: finalSourceAuth)
+
+            _ = try storage.activate(profile: transaction.snapshot.targetProfile)
+            try storage.assertActiveAccount(expectedAccountID: transaction.targetAccountID)
+            transaction.phase = .activated
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+        } catch {
+            return try rollbackPendingSwitch(
+                state: &state,
+                reason: "Switch activation failed: \(error.localizedDescription)")
+        }
+        return try validateActivatedSwitch(state: &state)
+    }
+
+    private func validateActivatedSwitch(state: inout RelayState) throws -> String {
+        guard var transaction = state.pendingSwitch, transaction.phase == .activated else {
+            throw RelayError.verification("Missing activated switch transaction")
+        }
+
+        var replacement: (any AppServerServing)?
+        let targetLimits: RateLimitSnapshot
+        do {
+            try storage.assertActiveAccount(expectedAccountID: transaction.targetAccountID)
+            let client = try makeAppServer(codexHome: storage.paths.codexHome)
+            replacement = client
+            targetLimits = try client.rateLimits()
+            guard targetLimits.hasOfficialLimitSignal else {
+                throw RelayError.rpc("Missing official rate limit windows")
+            }
+            client.stop()
+            replacement = nil
+            try storage.assertActiveAccount(expectedAccountID: transaction.targetAccountID)
+            try storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
+            guard !targetLimits.isExhausted(threshold: config.thresholdUsedPercent) else {
+                throw RelayError.verification(
+                    "Standby profile \(transaction.snapshot.targetProfile) is also exhausted")
+            }
+        } catch {
+            replacement?.stop()
+            _ = try? storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
+            if isAuthenticationFailure(error) || isVerificationFailure(error) {
+                return try rollbackPendingSwitch(
+                    state: &state,
+                    reason: "Target validation failed: \(error.localizedDescription)")
+            }
+            state.lastError = "Target validation will retry: \(error.localizedDescription)"
+            try? storage.saveState(state)
+            try? appController.openIfNeeded(path: config.chatGPTPath)
+            throw error
+        }
+
+        try? storage.updateAccountQuota(quotaStatus(
+            profile: transaction.snapshot.targetProfile, limits: targetLimits))
+        transaction.phase = .validated
+        state.pendingSwitch = transaction
+        state.activeProfile = transaction.snapshot.targetProfile
+        state.lastSwitchAt = Date()
+        state.lastError = nil
+        try storage.saveState(state)
+        try? storage.saveRuntime(RelayRuntimeStatus(
+            updatedAt: Date(), activeProfile: transaction.snapshot.targetProfile,
+            primaryUsedPercent: targetLimits.primary?.usedPercent,
+            secondaryUsedPercent: targetLimits.secondary?.usedPercent,
+            planType: targetLimits.planType,
+            message: "Switched \(transaction.snapshot.sourceProfile) -> \(transaction.snapshot.targetProfile)"))
+        do {
+            try appController.openIfNeeded(path: config.chatGPTPath)
+        } catch {
+            state.lastError = "ChatGPT reopen will retry: \(error.localizedDescription)"
+            try? storage.saveState(state)
+        }
+        let recovery = try submitPendingRecovery(state: &state)
+        return "Switched \(transaction.snapshot.sourceProfile) -> \(transaction.snapshot.targetProfile); \(recovery)"
+    }
+
+    private func submitPendingRecovery(state: inout RelayState) throws -> String {
+        guard var transaction = state.pendingSwitch,
+              transaction.phase == .validated || transaction.phase == .recovering else {
+            return "no pending recovery"
+        }
+        guard (try? storage.activeAccountID()) == transaction.targetAccountID else {
+            state.lastError = "Recovery paused because the target account is no longer active"
+            try? storage.saveState(state)
+            return "recovery paused"
+        }
+
+        transaction.phase = .recovering
+        state.pendingSwitch = transaction
+        try storage.saveState(state)
+        do {
+            try appController.openIfNeeded(path: config.chatGPTPath)
+        } catch {
+            state.lastError = "ChatGPT reopen will retry: \(error.localizedDescription)"
+            try? storage.saveState(state)
+        }
+
+        let pending = transaction.snapshot.threads.filter {
+            !state.completedRecoveryKeys.contains($0.recoveryKey)
+                && !(state.failedRecoveryKeys ?? []).contains($0.recoveryKey)
+        }
+        if pending.isEmpty {
+            let failed = state.failedRecoveryKeys ?? []
+            if !transaction.snapshot.threads.contains(where: { failed.contains($0.recoveryKey) }) {
+                state.lastError = nil
+            }
+            transaction.phase = .completed
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+            return try finalizeCompletedSwitch(state: &state, prefix: "recovery complete")
+        }
+
+        if hasActiveRecoveryHosts {
+            return "recovery turns are still running"
+        }
+        let client = try makeAppServer(codexHome: storage.paths.codexHome)
+        var submitted = 0
+        var abandoned = 0
+        var submittedThreadIDs: Set<String> = []
+        for entry in pending.prefix(max(config.maxConcurrentRecoveryTurns, 1)) {
+            let existingStatus: RecoveryMarkerStatus
+            do {
+                existingStatus = try client.recoveryMarkerStatus(entry)
+                if existingStatus == .completed {
+                    state.completedRecoveryKeys.insert(entry.recoveryKey)
+                    transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                    state.pendingSwitch = transaction
+                    try storage.saveState(state)
+                    continue
+                }
+                if existingStatus == .unknown {
+                    state.lastError = "Recovery marker status for \(entry.threadId) is unknown; will retry without submitting"
+                    state.pendingSwitch = transaction
+                    try storage.saveState(state)
+                    continue
+                }
+                if existingStatus == .terminalFailure || existingStatus == .inProgress {
+                    let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
+                    transaction.recoveryAttempts[entry.recoveryKey] = attempts
+                    state.lastError = "Recovery turn \(entry.threadId) did not complete (\(attempts)/3)"
+                    if attempts >= 3 {
+                        var failed = state.failedRecoveryKeys ?? []
+                        failed.insert(entry.recoveryKey)
+                        state.failedRecoveryKeys = failed
+                        abandoned += 1
+                        state.pendingSwitch = transaction
+                        try storage.saveState(state)
+                        continue
+                    }
+                }
+            } catch {
+                state.lastError = "Recovery marker check for \(entry.threadId) will retry: \(error.localizedDescription)"
+                state.pendingSwitch = transaction
+                try storage.saveState(state)
+                continue
+            }
+            do {
+                try client.resumeAndWake(entry)
+                submitted += 1
+                submittedThreadIDs.insert(entry.threadId)
+            } catch {
+                let wakeError = error
+                do {
+                    switch try client.recoveryMarkerStatus(entry) {
+                    case .completed:
+                        state.completedRecoveryKeys.insert(entry.recoveryKey)
+                        transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                    case .inProgress:
+                        submitted += 1
+                        submittedThreadIDs.insert(entry.threadId)
+                    case .absent, .terminalFailure:
+                        let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
+                        transaction.recoveryAttempts[entry.recoveryKey] = attempts
+                        state.lastError = "Wake \(entry.threadId) failed (\(attempts)/3): \(wakeError.localizedDescription)"
+                        if attempts >= 3 {
+                            var failed = state.failedRecoveryKeys ?? []
+                            failed.insert(entry.recoveryKey)
+                            state.failedRecoveryKeys = failed
+                            abandoned += 1
+                        }
+                    case .unknown:
+                        state.lastError = "Wake \(entry.threadId) had an ambiguous response; marker status is unknown"
+                    }
+                } catch {
+                    state.lastError = "Wake \(entry.threadId) had an ambiguous response; marker verification will retry: \(error.localizedDescription)"
+                }
+            }
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+        }
+
+        if submittedThreadIDs.isEmpty {
+            client.stop()
+        } else {
+            retainRecoveryHost(client, threadIDs: submittedThreadIDs)
+        }
+
+        let remaining = transaction.snapshot.threads.filter {
+            !state.completedRecoveryKeys.contains($0.recoveryKey)
+                && !(state.failedRecoveryKeys ?? []).contains($0.recoveryKey)
+        }.count
+        if remaining == 0 {
+            let failed = state.failedRecoveryKeys ?? []
+            if !transaction.snapshot.threads.contains(where: { failed.contains($0.recoveryKey) }) {
+                state.lastError = nil
+            }
+            transaction.phase = .completed
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+            return try finalizeCompletedSwitch(
+                state: &state,
+                prefix: "submitted \(submitted) recovery turns, abandoned \(abandoned)")
+        }
+        return "submitted \(submitted) recovery turns, \(remaining) pending"
+    }
+
+    private var hasActiveRecoveryHosts: Bool {
+        recoveryHostsLock.lock()
+        let active = !recoveryHosts.isEmpty
+        recoveryHostsLock.unlock()
+        return active
+    }
+
+    private func retainRecoveryHost(_ client: any AppServerServing, threadIDs: Set<String>) {
+        let hostID = UUID()
+        recoveryHostsLock.lock()
+        recoveryHosts[hostID] = client
+        recoveryHostsLock.unlock()
+
+        Thread.detachNewThread { [weak self] in
+            _ = client.waitForTurns(threadIDs, timeoutSeconds: 21_600)
+            client.stop()
+            guard let self else { return }
+            self.recoveryHostsLock.lock()
+            self.recoveryHosts.removeValue(forKey: hostID)
+            self.recoveryHostsLock.unlock()
+        }
+    }
+
+    private func stopRecoveryHosts() {
+        recoveryHostsLock.lock()
+        let hosts = Array(recoveryHosts.values)
+        recoveryHosts.removeAll()
+        recoveryHostsLock.unlock()
+        hosts.forEach { $0.stop() }
+    }
+
+    private func rollbackPendingSwitch(state: inout RelayState, reason: String) throws -> String {
+        guard var transaction = state.pendingSwitch else {
+            throw RelayError.verification(reason)
+        }
+        if let activeAccountID = try? storage.activeAccountID(),
+           activeAccountID != transaction.sourceAccountID,
+           activeAccountID != transaction.targetAccountID {
+            transaction.phase = .completed
+            state.pendingSwitch = transaction
+            state.activeProfile = storage.detectActiveProfile(in: config.profiles)
+            state.lastError = "\(reason); rollback cancelled because the active account changed externally"
+            try storage.saveState(state)
+            return try finalizeCompletedSwitch(state: &state, prefix: "Cancelled stale rollback")
+        }
+        do {
+            try appController.quit()
+        } catch {
+            state.lastError = "\(reason); rollback waiting for ChatGPT to stop: \(error.localizedDescription)"
+            try? storage.saveState(state)
+            throw RelayError.verification(state.lastError ?? reason)
+        }
+
+        if (try? storage.activeAccountID()) == transaction.targetAccountID,
+           storage.profileExists(transaction.snapshot.targetProfile) {
+            _ = try? storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
+        }
+        do {
+            let backup = try storage.loadSwitchBackup(id: transaction.snapshot.id)
+            try storage.restoreAuth(backup)
+            if let sourceAccountID = transaction.sourceAccountID {
+                try storage.assertActiveAccount(expectedAccountID: sourceAccountID)
+            }
+        } catch {
+            state.lastError = "\(reason); credential rollback failed: \(error.localizedDescription)"
+            try? storage.saveState(state)
+            throw RelayError.verification(state.lastError ?? reason)
+        }
+
+        state.activeProfile = transaction.snapshot.sourceProfile == "unmanaged"
+            ? storage.detectActiveProfile(in: config.profiles)
+            : transaction.snapshot.sourceProfile
+        state.lastSwitchAt = transaction.previousLastSwitchAt
+        state.lastError = reason
+        transaction.phase = .completed
+        state.pendingSwitch = transaction
+        try storage.saveState(state)
+        return try finalizeCompletedSwitch(state: &state, prefix: "Rolled back switch")
+    }
+
+    private func finalizeCompletedSwitch(state: inout RelayState, prefix: String) throws -> String {
+        guard let transaction = state.pendingSwitch, transaction.phase == .completed else {
+            return prefix
+        }
+        try appController.openIfNeeded(path: config.chatGPTPath)
+        state.pendingSwitch = nil
+        try storage.saveState(state)
+        storage.removeSwitchBackup(id: transaction.snapshot.id)
+        return prefix
+    }
+
+    private func isAuthenticationFailure(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("token_invalidated")
+            || message.contains("401")
+            || message.contains("unauthorized")
+            || message.contains("authentication token")
+    }
+
+    private func isVerificationFailure(_ error: Error) -> Bool {
+        guard let relayError = error as? RelayError else { return false }
+        if case .verification = relayError { return true }
+        return false
+    }
+
+    func run(parentPID: pid_t? = nil) throws -> Never {
+        if let parentPID { monitorParent(parentPID) }
+        while true {
+            let timestamp = ISO8601DateFormatter().string(from: Date())
+            do {
+                let result = try checkOnce()
+                writeLog("[\(timestamp)] \(result)")
+            } catch {
+                writeLog("[\(timestamp)] ERROR \(error.localizedDescription)")
+                if var state = try? storage.loadState() {
+                    state.lastError = error.localizedDescription
+                    try? storage.saveState(state)
+                    try? storage.saveRuntime(RelayRuntimeStatus(
+                        updatedAt: Date(), activeProfile: state.activeProfile,
+                        primaryUsedPercent: nil, secondaryUsedPercent: nil,
+                        planType: nil, message: "ERROR \(error.localizedDescription)"
+                    ))
+                }
+            }
+            Thread.sleep(forTimeInterval: Double(config.pollIntervalSeconds))
+        }
+    }
+
+    private func writeLog(_ line: String) {
+        guard let data = "\(line)\n".data(using: .utf8) else { return }
+        try? FileHandle.standardOutput.write(contentsOf: data)
+    }
+
+    private func quotaStatus(profile: String, limits: RateLimitSnapshot) -> AccountQuotaStatus {
+        AccountQuotaStatus(profile: profile, updatedAt: Date(), primary: limits.primary,
+                           secondary: limits.secondary, planType: limits.planType, error: nil,
+                           duplicateOf: storage.duplicateProfile(for: profile, among: config.profiles))
+    }
+
+    private func refreshNextStandbyQuota(state: inout RelayState, activeProfile: String?) throws {
+        let scheduledProfiles = config.scheduledProfiles
+        guard !scheduledProfiles.isEmpty else { return }
+        let start = (state.nextQuotaProfileIndex ?? 0) % scheduledProfiles.count
+        for offset in 0..<scheduledProfiles.count {
+            let index = (start + offset) % scheduledProfiles.count
+            let profile = scheduledProfiles[index]
+            guard profile != activeProfile, storage.profileExists(profile) else { continue }
+            var probe: (any AppServerServing)?
+            do {
+                let home = try storage.prepareProfileHome(profile)
+                let client = try makeAppServer(codexHome: home)
+                probe = client
+                let limits = try client.rateLimits()
+                client.stop()
+                probe = nil
+                try storage.updateAccountQuota(quotaStatus(profile: profile, limits: limits))
+            } catch {
+                probe?.stop()
+                try storage.updateAccountQuota(AccountQuotaStatus(
+                    profile: profile, updatedAt: Date(), primary: nil, secondary: nil,
+                    planType: nil, error: error.localizedDescription
+                ))
+            }
+            state.nextQuotaProfileIndex = (index + 1) % scheduledProfiles.count
+            try storage.saveState(state)
+            return
+        }
+    }
+
+    private func monitorParent(_ parentPID: pid_t) {
+        Thread.detachNewThread {
+            while Darwin.kill(parentPID, 0) == 0 || errno == EPERM {
+                Thread.sleep(forTimeInterval: 1)
+            }
+            Darwin._exit(0)
+        }
+    }
+}
