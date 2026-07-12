@@ -9,7 +9,7 @@ protocol AppServerServing: AnyObject, Sendable {
     func unfinishedThreads(from threads: [ThreadRecord], recentHours: Int, now: Date) -> [ThreadRecord]
     func recoveryMarkerStatus(_ entry: RecoveryEntry) throws -> RecoveryMarkerStatus
     func resumeAndWake(_ entry: RecoveryEntry) throws
-    func waitForTurns(_ threadIDs: Set<String>, timeoutSeconds: Int) -> Set<String>
+    func waitForTurns(_ entries: [RecoveryEntry], timeoutSeconds: Int) -> Set<String>
 }
 
 extension AppServerServing {
@@ -129,6 +129,162 @@ final class RelayEngine: @unchecked Sendable {
         fputs("diagnose: unfinished classification\n", stderr)
         let unfinished = server.unfinishedThreads(from: listed, recentHours: config.recoveryRecentHours)
         return "app-server=ok plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a") listedThreads=\(listed.count) recoverableThreads=\(unfinished.count)"
+    }
+
+    func importCurrentProfile(as requestedProfile: String) throws -> String {
+        try storage.validateProfileName(requestedProfile)
+        var state = try storage.loadState()
+        guard state.pendingSwitch == nil else {
+            throw RelayError.verification(
+                "An account switch is being recovered. Wait for the watchdog to finish before importing.")
+        }
+
+        let sourceAccountID = try storage.validateCurrentChatGPTAuth()
+        let existingProfile = storage.detectActiveProfile(in: config.profiles)
+        if existingProfile == nil {
+            guard !config.profiles.contains(requestedProfile),
+                  !storage.profileExists(requestedProfile) else {
+                throw RelayError.invalidProfile("Profile \(requestedProfile) already exists")
+            }
+        }
+
+        let server = try makeAppServer(codexHome: storage.paths.codexHome)
+        let limits: RateLimitSnapshot
+        do {
+            limits = try server.rateLimits()
+        } catch {
+            server.stop()
+            throw error
+        }
+        server.stop()
+        guard limits.hasOfficialLimitSignal else {
+            throw RelayError.rpc("Missing official rate limit windows")
+        }
+        let refreshedAccountID = try storage.validateCurrentChatGPTAuth()
+        guard refreshedAccountID == sourceAccountID else {
+            throw RelayError.verification(
+                "Current Codex account changed while it was being imported")
+        }
+
+        if let existingProfile {
+            try storage.saveCurrentAuth(
+                as: existingProfile, expectedAccountID: sourceAccountID)
+            try storage.updateAccountQuota(quotaStatus(profile: existingProfile, limits: limits))
+            state.activeProfile = existingProfile
+            try storage.saveState(state)
+            return "Current ChatGPT account is already managed as \(existingProfile); credentials refreshed"
+        }
+
+        let originalState = state
+        var updatedConfig = config
+        do {
+            try storage.saveCurrentAuth(
+                as: requestedProfile, expectedAccountID: sourceAccountID)
+            try storage.updateAccountQuota(quotaStatus(profile: requestedProfile, limits: limits))
+            updatedConfig.profiles.append(requestedProfile)
+            try storage.saveConfig(updatedConfig)
+            state.activeProfile = requestedProfile
+            try storage.saveState(state)
+        } catch {
+            try? storage.deleteProfile(requestedProfile)
+            try? storage.saveConfig(config)
+            try? storage.saveState(originalState)
+            throw error
+        }
+
+        return "Imported current ChatGPT account as \(requestedProfile): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")"
+    }
+
+    func refreshAllQuotas() throws -> String {
+        var state = try storage.loadState()
+        guard state.pendingSwitch == nil else {
+            throw RelayError.verification(
+                "An account switch is being recovered. Wait for the watchdog to finish before refreshing.")
+        }
+
+        let activeProfile = storage.detectActiveProfile(in: config.profiles)
+        if state.activeProfile != activeProfile {
+            state.activeProfile = activeProfile
+        }
+        guard !config.profiles.isEmpty else {
+            try storage.saveState(state)
+            return "No managed profiles"
+        }
+
+        let orderedProfiles = (activeProfile.map { [$0] } ?? [])
+            + config.profiles.filter { $0 != activeProfile }
+        var activeLimits: RateLimitSnapshot?
+        var failures: [String] = []
+
+        for profile in orderedProfiles {
+            do {
+                let isActive = profile == activeProfile
+                let codexHome: URL
+                if isActive {
+                    codexHome = storage.paths.codexHome
+                } else {
+                    guard storage.profileExists(profile) else {
+                        throw RelayError.missingFile("Saved credential for \(profile)")
+                    }
+                    codexHome = try storage.prepareProfileHome(profile)
+                }
+
+                let server = try makeAppServer(codexHome: codexHome)
+                defer { server.stop() }
+                let limits = try server.rateLimits()
+                guard limits.hasOfficialLimitSignal else {
+                    throw RelayError.rpc("Missing official rate limit windows")
+                }
+                if isActive {
+                    try storage.saveCurrentAuth(as: profile)
+                    activeLimits = limits
+                }
+                try storage.updateAccountQuota(quotaStatus(profile: profile, limits: limits))
+            } catch {
+                if profile == activeProfile, shouldPersistActiveCredential(after: error) {
+                    _ = try? storage.saveCurrentAuth(as: profile)
+                }
+                let detail = error.localizedDescription
+                failures.append("\(profile)=\(detail)")
+                try? storage.updateAccountQuota(AccountQuotaStatus(
+                    profile: profile, updatedAt: Date(), primary: nil, secondary: nil,
+                    planType: nil, error: detail,
+                    duplicateOf: storage.duplicateProfile(for: profile, among: config.profiles)
+                ))
+            }
+        }
+
+        let summary: String
+        if let activeLimits {
+            summary = "primary=\(activeLimits.primary?.usedPercent.description ?? "n/a") secondary=\(activeLimits.secondary?.usedPercent.description ?? "n/a") plan=\(activeLimits.planType ?? "unknown")"
+        } else {
+            summary = "active quota unavailable"
+        }
+        try storage.saveRuntime(RelayRuntimeStatus(
+            updatedAt: Date(), activeProfile: activeProfile,
+            primaryUsedPercent: activeLimits?.primary?.usedPercent,
+            secondaryUsedPercent: activeLimits?.secondary?.usedPercent,
+            planType: activeLimits?.planType, message: "Manual refresh: \(summary)"
+        ))
+
+        if failures.isEmpty {
+            try storage.saveState(state)
+            return "Refreshed \(orderedProfiles.count) profiles: \(summary)"
+        }
+
+        try storage.saveState(state)
+        throw RelayError.verification(failures.joined(separator: "; "))
+    }
+
+    private func shouldPersistActiveCredential(after error: Error) -> Bool {
+        let detail = error.localizedDescription.lowercased()
+        let authenticationFailures = [
+            "401", "403", "unauthorized", "forbidden", "token_invalidated",
+            "invalid token", "token expired", "not authenticated",
+            "authentication failed", "authentication required", "login required",
+            "refresh token"
+        ]
+        return !authenticationFailures.contains { detail.contains($0) }
     }
 
     func checkOnce(force: Bool = false) throws -> String {
@@ -474,6 +630,18 @@ final class RelayEngine: @unchecked Sendable {
             return "recovery paused"
         }
 
+        if (transaction.recoveryProtocolVersion ?? 1)
+            < SwitchTransaction.currentRecoveryProtocolVersion {
+            let transactionKeys = Set(transaction.snapshot.threads.map(\.recoveryKey))
+            var failed = state.failedRecoveryKeys ?? []
+            failed.subtract(transactionKeys)
+            state.failedRecoveryKeys = failed
+            transaction.recoveryAttempts.removeAll()
+            transaction.recoveryProtocolVersion = SwitchTransaction.currentRecoveryProtocolVersion
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+        }
+
         transaction.phase = .recovering
         state.pendingSwitch = transaction
         try storage.saveState(state)
@@ -484,11 +652,43 @@ final class RelayEngine: @unchecked Sendable {
             try? storage.saveState(state)
         }
 
+        if hasActiveRecoveryHosts {
+            return "recovery turns are still running"
+        }
+
+        var auditedClient: (any AppServerServing)?
+        let failedEntries = transaction.snapshot.threads.filter {
+            (state.failedRecoveryKeys ?? []).contains($0.recoveryKey)
+        }
+        if !failedEntries.isEmpty {
+            let auditClient = try makeAppServer(codexHome: storage.paths.codexHome)
+            auditedClient = auditClient
+            var failed = state.failedRecoveryKeys ?? []
+            for entry in failedEntries {
+                guard let status = try? auditClient.recoveryMarkerStatus(entry) else { continue }
+                switch status {
+                case .completed:
+                    failed.remove(entry.recoveryKey)
+                    state.completedRecoveryKeys.insert(entry.recoveryKey)
+                    transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                case .inProgress:
+                    failed.remove(entry.recoveryKey)
+                    transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                case .absent, .terminalFailure, .unknown:
+                    break
+                }
+            }
+            state.failedRecoveryKeys = failed
+            state.pendingSwitch = transaction
+            try storage.saveState(state)
+        }
+
         let pending = transaction.snapshot.threads.filter {
             !state.completedRecoveryKeys.contains($0.recoveryKey)
                 && !(state.failedRecoveryKeys ?? []).contains($0.recoveryKey)
         }
         if pending.isEmpty {
+            auditedClient?.stop()
             let failed = state.failedRecoveryKeys ?? []
             if !transaction.snapshot.threads.contains(where: { failed.contains($0.recoveryKey) }) {
                 state.lastError = nil
@@ -499,13 +699,10 @@ final class RelayEngine: @unchecked Sendable {
             return try finalizeCompletedSwitch(state: &state, prefix: "recovery complete")
         }
 
-        if hasActiveRecoveryHosts {
-            return "recovery turns are still running"
-        }
-        let client = try makeAppServer(codexHome: storage.paths.codexHome)
+        let client = try auditedClient ?? makeAppServer(codexHome: storage.paths.codexHome)
         var submitted = 0
         var abandoned = 0
-        var submittedThreadIDs: Set<String> = []
+        var watchedEntries: [RecoveryEntry] = []
         for entry in pending.prefix(max(config.maxConcurrentRecoveryTurns, 1)) {
             let existingStatus: RecoveryMarkerStatus
             do {
@@ -523,7 +720,13 @@ final class RelayEngine: @unchecked Sendable {
                     try storage.saveState(state)
                     continue
                 }
-                if existingStatus == .terminalFailure || existingStatus == .inProgress {
+                if existingStatus == .inProgress {
+                    watchedEntries.append(entry)
+                    state.pendingSwitch = transaction
+                    try storage.saveState(state)
+                    continue
+                }
+                if existingStatus == .terminalFailure {
                     let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
                     transaction.recoveryAttempts[entry.recoveryKey] = attempts
                     state.lastError = "Recovery turn \(entry.threadId) did not complete (\(attempts)/3)"
@@ -546,7 +749,7 @@ final class RelayEngine: @unchecked Sendable {
             do {
                 try client.resumeAndWake(entry)
                 submitted += 1
-                submittedThreadIDs.insert(entry.threadId)
+                watchedEntries.append(entry)
             } catch {
                 let wakeError = error
                 do {
@@ -556,7 +759,7 @@ final class RelayEngine: @unchecked Sendable {
                         transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
                     case .inProgress:
                         submitted += 1
-                        submittedThreadIDs.insert(entry.threadId)
+                        watchedEntries.append(entry)
                     case .absent, .terminalFailure:
                         let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
                         transaction.recoveryAttempts[entry.recoveryKey] = attempts
@@ -578,10 +781,10 @@ final class RelayEngine: @unchecked Sendable {
             try storage.saveState(state)
         }
 
-        if submittedThreadIDs.isEmpty {
+        if watchedEntries.isEmpty {
             client.stop()
         } else {
-            retainRecoveryHost(client, threadIDs: submittedThreadIDs)
+            retainRecoveryHost(client, entries: watchedEntries)
         }
 
         let remaining = transaction.snapshot.threads.filter {
@@ -610,14 +813,14 @@ final class RelayEngine: @unchecked Sendable {
         return active
     }
 
-    private func retainRecoveryHost(_ client: any AppServerServing, threadIDs: Set<String>) {
+    private func retainRecoveryHost(_ client: any AppServerServing, entries: [RecoveryEntry]) {
         let hostID = UUID()
         recoveryHostsLock.lock()
         recoveryHosts[hostID] = client
         recoveryHostsLock.unlock()
 
         Thread.detachNewThread { [weak self] in
-            _ = client.waitForTurns(threadIDs, timeoutSeconds: 21_600)
+            _ = client.waitForTurns(entries, timeoutSeconds: 21_600)
             client.stop()
             guard let self else { return }
             self.recoveryHostsLock.lock()

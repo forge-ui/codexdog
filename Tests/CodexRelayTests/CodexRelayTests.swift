@@ -148,6 +148,26 @@ import Testing
     #expect(authToken(try Data(contentsOf: storage.paths.profileAuth("profile-a"))) == "a-token")
 }
 
+@Test func expectedIdentityPreventsImportingAChangedActiveAccount() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codex = root.appendingPathComponent("codex")
+    try FileManager.default.createDirectory(at: codex, withIntermediateDirectories: true)
+    let storage = RelayStorage(paths: RelayPaths(
+        config: RelayConfig(codexHome: codex.path),
+        rootOverride: root.appendingPathComponent("relay")))
+    try storage.bootstrap()
+    try authData(accountID: "account-b", token: "b-token")
+        .write(to: storage.paths.activeAuth)
+
+    #expect(throws: RelayError.self) {
+        try storage.saveCurrentAuth(as: "new-profile", expectedAccountID: "account-a")
+    }
+
+    #expect(!storage.profileExists("new-profile"))
+    #expect(try storage.activeAccountID() == "account-b")
+}
+
 @Test func deletingProfileRemovesCredentialAndCachedQuota() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }

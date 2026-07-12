@@ -2,6 +2,31 @@ import Foundation
 import AppKit
 import Darwin
 
+enum MenuRefreshPhase: Equatable {
+    case idle
+    case refreshing
+    case succeeded
+    case failed
+}
+
+enum AccountEnrollmentFeedback: Equatable {
+    case success(String)
+    case failure(String)
+}
+
+typealias LocalUsageFetcher = @Sendable () async throws -> LocalUsageSnapshot
+typealias OfficialQuotaRefresher = @Sendable (_ profileCount: Int) async throws -> Void
+
+struct MenuRefreshTiming: Sendable {
+    let minimumVisibleDuration: Duration
+    let resultVisibleDuration: Duration
+
+    static let standard = MenuRefreshTiming(
+        minimumVisibleDuration: .milliseconds(650),
+        resultVisibleDuration: .milliseconds(900)
+    )
+}
+
 @MainActor
 final class RelayMenuStore: ObservableObject {
     @Published var config: MenuRelayConfig?
@@ -13,17 +38,25 @@ final class RelayMenuStore: ObservableObject {
     @Published var message: String?
     @Published var commandOutput = ""
     @Published var commandIsRunning = false
+    @Published private(set) var activeProfileCommand: String?
+    @Published private(set) var accountEnrollmentFeedback: AccountEnrollmentFeedback?
     @Published private(set) var enrollmentAuthorizationURL: URL?
     @Published private(set) var enrollmentAuthorizationCode: String?
     @Published var localUsage: LocalUsageSnapshot?
     @Published var localUsageError: String?
     @Published var localUsageIsLoading = false
+    @Published private(set) var refreshPhase: MenuRefreshPhase = .idle
 
     private let supervisor = RelaySupervisor.shared
+    private let rootURL: URL
+    private let localUsageFetcher: LocalUsageFetcher
+    private let officialQuotaRefresher: OfficialQuotaRefresher
+    private let refreshTiming: MenuRefreshTiming
     private var timer: Timer?
     private var commandProcess: Process?
     private var rawCommandOutput = ""
     private var localUsageTask: Task<Void, Never>?
+    private var refreshTask: Task<Void, Never>?
     private var lastLocalUsageRefresh: Date?
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -31,7 +64,22 @@ final class RelayMenuStore: ObservableObject {
         return decoder
     }()
 
-    init(startSupervisor: Bool = true, loadLocalUsage: Bool = true) {
+    init(
+        startSupervisor: Bool = true,
+        loadLocalUsage: Bool = true,
+        startPolling: Bool = true,
+        rootURL: URL? = nil,
+        refreshTiming: MenuRefreshTiming = .standard,
+        localUsageFetcher: @escaping LocalUsageFetcher = { try await LocalUsageService.fetch() },
+        officialQuotaRefresher: @escaping OfficialQuotaRefresher = { profileCount in
+            try await RelayQuotaRefreshService.refresh(profileCount: profileCount)
+        }
+    ) {
+        self.rootURL = rootURL ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CodexRelay", isDirectory: true)
+        self.refreshTiming = refreshTiming
+        self.localUsageFetcher = localUsageFetcher
+        self.officialQuotaRefresher = officialQuotaRefresher
         refresh()
         if loadLocalUsage {
             refreshLocalUsage(force: true)
@@ -41,11 +89,15 @@ final class RelayMenuStore: ObservableObject {
             catch { message = error.localizedDescription }
         }
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        NotificationCenter.default.addObserver(forName: .relayWorkerChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        if startPolling {
+            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
+            }
+            NotificationCenter.default.addObserver(
+                forName: .relayWorkerChanged, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
+            }
         }
     }
 
@@ -67,9 +119,87 @@ final class RelayMenuStore: ObservableObject {
         profileEmails[profile] ?? profile
     }
 
+    var isRefreshBusy: Bool { refreshPhase != .idle }
+    var visibleErrors: [String] {
+        var errors: [String] = []
+        if let stateError = state?.lastError, !stateError.isEmpty {
+            errors.append(stateError)
+        }
+        if let message, !message.isEmpty, !errors.contains(message) {
+            errors.append(message)
+        }
+        return errors
+    }
+
+    func manualRefresh() {
+        guard refreshTask == nil, !commandIsRunning else { return }
+
+        message = nil
+        localUsageError = nil
+        refreshPhase = .refreshing
+        refresh()
+        refreshLocalUsage(force: true)
+
+        let quotaRefresher = officialQuotaRefresher
+        let profileCount = config?.profiles.count ?? 0
+        let timing = refreshTiming
+        refreshTask = Task { [weak self] in
+            let minimumDelay = Task {
+                try? await Task.sleep(for: timing.minimumVisibleDuration)
+            }
+            let refreshError: String?
+            do {
+                try await quotaRefresher(profileCount)
+                refreshError = nil
+            } catch is CancellationError {
+                refreshError = nil
+            } catch {
+                refreshError = error.localizedDescription
+            }
+            await minimumDelay.value
+
+            guard let self else { return }
+            while self.localUsageTask != nil, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard !Task.isCancelled else {
+                self.refreshPhase = .idle
+                self.refreshTask = nil
+                return
+            }
+
+            self.refresh()
+            let localRefreshError = self.localUsageError
+            if let refreshError, !refreshError.isEmpty {
+                self.refreshPhase = .failed
+                self.message = "刷新失败：\(self.compactMessage(refreshError))"
+            } else if let localRefreshError, !localRefreshError.isEmpty {
+                self.refreshPhase = .failed
+                self.message = "本机用量刷新失败：\(self.compactMessage(localRefreshError))"
+            } else {
+                self.refreshPhase = .succeeded
+                self.message = nil
+            }
+
+            try? await Task.sleep(for: timing.resultVisibleDuration)
+            guard !Task.isCancelled else {
+                self.refreshPhase = .idle
+                self.refreshTask = nil
+                return
+            }
+            self.refreshPhase = .idle
+            self.refreshTask = nil
+        }
+    }
+
     func enrollNewAccount() {
         let generatedName = "account-" + UUID().uuidString.prefix(8).lowercased()
         runProfileCommand("login", name: generatedName)
+    }
+
+    func importCurrentAccount() {
+        let generatedName = "account-" + UUID().uuidString.prefix(8).lowercased()
+        runProfileCommand("import-current", name: generatedName)
     }
 
     func isProfileScheduled(_ profile: String) -> Bool {
@@ -93,6 +223,7 @@ final class RelayMenuStore: ObservableObject {
         guard localUsageTask == nil else { return }
 
         localUsageIsLoading = true
+        let fetcher = localUsageFetcher
         localUsageTask = Task { [weak self] in
             defer {
                 self?.localUsageIsLoading = false
@@ -100,7 +231,7 @@ final class RelayMenuStore: ObservableObject {
                 self?.lastLocalUsageRefresh = Date()
             }
             do {
-                self?.localUsage = try await LocalUsageService.fetch()
+                self?.localUsage = try await fetcher()
                 self?.localUsageError = nil
             } catch {
                 self?.localUsageError = error.localizedDescription
@@ -119,6 +250,7 @@ final class RelayMenuStore: ObservableObject {
     }
 
     func setAutomaticSwitching(_ enabled: Bool) {
+        guard !isRefreshBusy, !commandIsRunning else { return }
         guard let helper = supervisor.helperPath() else { message = "找不到 codex-relay helper"; return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: helper)
@@ -139,10 +271,12 @@ final class RelayMenuStore: ObservableObject {
     }
 
     func runProfileCommand(_ action: String, name: String) {
+        guard !isRefreshBusy else { return }
         guard commandProcess?.isRunning != true else { return }
         guard !name.isEmpty else { message = "请输入账号名称"; return }
         guard let helper = supervisor.helperPath() else { message = "找不到 codex-relay helper"; return }
 
+        message = nil
         let workerWasRunning = supervisor.isRunning
         let pausesWorker = ["disable", "enable", "delete"].contains(action)
         if pausesWorker && workerWasRunning {
@@ -151,6 +285,7 @@ final class RelayMenuStore: ObservableObject {
 
         resetCommandOutput()
         commandIsRunning = true
+        activeProfileCommand = action
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: helper)
@@ -170,16 +305,36 @@ final class RelayMenuStore: ObservableObject {
             Task { @MainActor in
                 self?.commandIsRunning = false
                 self?.commandProcess = nil
-                if workerWasRunning && (pausesWorker || (process.terminationStatus == 0 && action == "login")) {
+                self?.activeProfileCommand = nil
+                var restartError: String?
+                let reloadsWorker = process.terminationStatus == 0
+                    && ["login", "import-current"].contains(action)
+                if workerWasRunning && (pausesWorker || reloadsWorker) {
                     self?.supervisor.stop()
                     do { try self?.supervisor.start() }
-                    catch { self?.message = error.localizedDescription }
+                    catch { restartError = error.localizedDescription }
                 }
                 self?.refresh()
-                if process.terminationStatus != 0 {
-                    self?.message = "账号操作失败"
-                } else if action != "login" {
-                    self?.message = nil
+                if let self {
+                    let completionMessage = ProfileCommandCompletionPolicy.message(
+                        terminationStatus: process.terminationStatus,
+                        restartError: restartError,
+                        commandOutput: self.commandOutput
+                    )
+                    self.message = completionMessage
+                    if ["login", "import-current"].contains(action) {
+                        if process.terminationStatus == 0, completionMessage == nil {
+                            self.accountEnrollmentFeedback = .success(
+                                action == "import-current"
+                                    ? "当前账号已同步到 CodexDog"
+                                    : "其他账号已添加"
+                            )
+                        } else {
+                            self.accountEnrollmentFeedback = .failure(
+                                completionMessage ?? "账号添加失败"
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -188,10 +343,14 @@ final class RelayMenuStore: ObservableObject {
             commandProcess = process
         } catch {
             commandIsRunning = false
+            activeProfileCommand = nil
             if pausesWorker && workerWasRunning {
                 try? supervisor.start()
             }
             message = error.localizedDescription
+            if ["login", "import-current"].contains(action) {
+                accountEnrollmentFeedback = .failure(error.localizedDescription)
+            }
         }
     }
 
@@ -214,9 +373,13 @@ final class RelayMenuStore: ObservableObject {
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshPhase = .idle
         localUsageTask?.cancel()
         localUsageTask = nil
         LocalUsageProcessRegistry.shared.stop()
+        RelayQuotaRefreshProcessRegistry.shared.stop()
         terminateCommandProcessTree()
         supervisor.stop()
     }
@@ -225,10 +388,7 @@ final class RelayMenuStore: ObservableObject {
     var secondaryRemaining: Int? { runtime?.secondaryUsedPercent.map { max(0, 100 - $0) } }
     var automaticSwitchingEnabled: Bool { !(config?.dryRun ?? true) }
 
-    private var root: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexRelay", isDirectory: true)
-    }
+    private var root: URL { rootURL }
 
     private func decode<T: Decodable>(_ type: T.Type, at url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }
@@ -238,6 +398,7 @@ final class RelayMenuStore: ObservableObject {
     private func resetCommandOutput() {
         rawCommandOutput = ""
         commandOutput = ""
+        accountEnrollmentFeedback = nil
         enrollmentAuthorizationURL = nil
         enrollmentAuthorizationCode = nil
     }
@@ -248,6 +409,11 @@ final class RelayMenuStore: ObservableObject {
         commandOutput = parsed.cleanOutput
         enrollmentAuthorizationURL = parsed.authorizationURL
         enrollmentAuthorizationCode = parsed.authorizationCode
+    }
+
+    private func compactMessage(_ message: String) -> String {
+        let line = message.split(whereSeparator: \.isNewline).last.map(String.init) ?? message
+        return String(line.replacingOccurrences(of: "codex-relay: ", with: "").prefix(160))
     }
 
     private func terminateCommandProcessTree() {
@@ -272,6 +438,7 @@ final class RelayMenuStore: ObservableObject {
         }
         commandProcess = nil
         commandIsRunning = false
+        activeProfileCommand = nil
     }
 
     private func descendantPIDs(of parentPID: pid_t) -> [pid_t] {

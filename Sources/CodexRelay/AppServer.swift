@@ -14,7 +14,6 @@ final class AppServerClient: @unchecked Sendable {
     private var errorTail = Data()
     private var errorCaptureFinished = false
     private var stopped = false
-    private var completedThreadIDs: Set<String> = []
     private var receiveBuffer = Data()
     private var newlineSearchOffset = 0
 
@@ -92,7 +91,6 @@ final class AppServerClient: @unchecked Sendable {
             guard let line = try readLine(timeoutMilliseconds: waitMilliseconds), !line.isEmpty else { continue }
             let message = try decoder.decode(JSONValue.self, from: line)
             guard let object = message.object else { continue }
-            captureNotification(object)
             if object["id"]?.int == id {
                 if let rpcError = object["error"]?.object {
                     throw RelayError.rpc(rpcError["message"]?.string ?? "Unknown app-server error")
@@ -178,44 +176,86 @@ final class AppServerClient: @unchecked Sendable {
     }
 
     func recoveryMarkerStatus(_ entry: RecoveryEntry) throws -> RecoveryMarkerStatus {
+        try recoveryMarkerStatus(entry, timeoutSeconds: 30)
+    }
+
+    private func recoveryMarkerStatus(
+        _ entry: RecoveryEntry, timeoutSeconds: TimeInterval
+    ) throws -> RecoveryMarkerStatus {
         let result = try request("thread/read", params: .object([
             "threadId": .string(entry.threadId), "includeTurns": .bool(true)
-        ]))
+        ]), timeoutSeconds: timeoutSeconds)
         guard let turns = result.object?["thread"]?.object?["turns"]?.array else {
             throw RelayError.rpc("Missing thread turns while checking recovery marker")
         }
-        guard let matchingTurn = turns.reversed().first(where: { $0.contains(string: entry.recoveryKey) }) else {
-            return .absent
+        var foundMatch = false
+        var foundInProgress = false
+        var foundTerminalFailure = false
+        for turn in turns where turn.contains(string: entry.recoveryKey) {
+            foundMatch = true
+            switch turn.object?["status"]?.string {
+            case "completed": return .completed
+            case "inProgress", "in_progress": foundInProgress = true
+            case "failed", "interrupted", "cancelled", "canceled": foundTerminalFailure = true
+            default: break
+            }
         }
-        switch matchingTurn.object?["status"]?.string {
-        case "completed": return .completed
-        case "inProgress", "in_progress": return .inProgress
-        case "failed", "interrupted", "cancelled", "canceled": return .terminalFailure
-        default: return .unknown
-        }
+        if foundInProgress { return .inProgress }
+        if foundTerminalFailure { return .terminalFailure }
+        return foundMatch ? .unknown : .absent
     }
 
-    func waitForTurns(_ threadIDs: Set<String>, timeoutSeconds: Int) -> Set<String> {
-        let deadline = Date().addingTimeInterval(Double(timeoutSeconds))
-        while !threadIDs.isSubset(of: completedThreadIDs), process.isRunning, Date() < deadline {
-            guard let line = try? readLine(timeoutMilliseconds: 1_000), !line.isEmpty,
-                  let message = try? decoder.decode(JSONValue.self, from: line),
-                  let object = message.object else { continue }
-            captureNotification(object)
+    func waitForTurns(_ entries: [RecoveryEntry], timeoutSeconds: Int) -> Set<String> {
+        var remaining = Dictionary(uniqueKeysWithValues: entries.map { ($0.threadId, $0) })
+        var completedThreadIDs: Set<String> = []
+        var unresolvedSince: [String: Date] = [:]
+        let markerUnresolvedGraceSeconds: TimeInterval = 2
+        let unresolvedGraceExpired: (String) -> Bool = { recoveryKey in
+            let firstUnresolvedAt = unresolvedSince[recoveryKey] ?? Date()
+            unresolvedSince[recoveryKey] = firstUnresolvedAt
+            return Date().timeIntervalSince(firstUnresolvedAt) >= markerUnresolvedGraceSeconds
         }
-        return threadIDs.intersection(completedThreadIDs)
+        let deadline = Date().addingTimeInterval(Double(timeoutSeconds))
+        let pollMilliseconds = min(5_000, max(100, timeoutSeconds * 200))
+        while !remaining.isEmpty, process.isRunning, Date() < deadline {
+            for (threadID, entry) in remaining {
+                if completedThreadIDs.contains(threadID) {
+                    remaining.removeValue(forKey: threadID)
+                    continue
+                }
+                let status: RecoveryMarkerStatus
+                do {
+                    status = try recoveryMarkerStatus(entry, timeoutSeconds: 5)
+                } catch {
+                    if unresolvedGraceExpired(entry.recoveryKey) {
+                        remaining.removeValue(forKey: threadID)
+                    }
+                    continue
+                }
+                switch status {
+                case .completed:
+                    completedThreadIDs.insert(threadID)
+                    remaining.removeValue(forKey: threadID)
+                case .terminalFailure:
+                    remaining.removeValue(forKey: threadID)
+                case .absent, .unknown:
+                    if unresolvedGraceExpired(entry.recoveryKey) {
+                        remaining.removeValue(forKey: threadID)
+                    }
+                case .inProgress:
+                    unresolvedSince.removeValue(forKey: entry.recoveryKey)
+                }
+            }
+            guard !remaining.isEmpty, process.isRunning, Date() < deadline else { break }
+            _ = try? readLine(timeoutMilliseconds: pollMilliseconds)
+        }
+        return Set(entries.map(\.threadId)).intersection(completedThreadIDs)
     }
 
     private func send(_ value: JSONValue) throws {
         var data = try encoder.encode(value)
         data.append(0x0A)
         try input.fileHandleForWriting.write(contentsOf: data)
-    }
-
-    private func captureNotification(_ object: [String: JSONValue]) {
-        guard object["method"]?.string == "turn/completed",
-              let threadID = object["params"]?.object?["threadId"]?.string else { return }
-        completedThreadIDs.insert(threadID)
     }
 
     private func readLine(timeoutMilliseconds: Int? = nil) throws -> Data? {

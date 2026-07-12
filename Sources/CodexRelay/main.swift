@@ -51,6 +51,7 @@ func usage() {
     CodexRelay 0.7.0
       codex-relay init
       codex-relay profile login <name>
+      codex-relay profile import-current <name>
       codex-relay profile verify <name>
       codex-relay profile save <name>
       codex-relay profile list
@@ -58,6 +59,7 @@ func usage() {
       codex-relay profile enable <name>
       codex-relay profile delete <name>
       codex-relay config auto-switch <on|off>
+      codex-relay refresh
       codex-relay check [--force]
       codex-relay diagnose
       codex-relay run
@@ -79,7 +81,7 @@ do {
     let initial = RelayConfig.default
     let initialPaths = RelayPaths(config: initial)
     let advisoryLock = RelayAdvisoryLock(root: initialPaths.root)
-    let lockedCommands = ["init", "profile", "config", "check", "diagnose", "run"]
+    let lockedCommands = ["init", "profile", "config", "refresh", "check", "diagnose", "run"]
     let isProfileLogin = arguments.first == "profile"
         && arguments.indices.contains(1) && arguments[1] == "login"
     var operationLease = lockedCommands.contains(arguments.first ?? "") && !isProfileLogin
@@ -154,6 +156,8 @@ do {
                 duplicateOf: storage.duplicateProfile(for: name, among: config.profiles)
             ))
             print("Verified \(name): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")")
+        case "import-current" where arguments.count == 3:
+            print(try engine.importCurrentProfile(as: arguments[2]))
         case "save" where arguments.count == 3:
             try requireIdleSwitchTransaction(storage)
             let name = arguments[2]
@@ -211,7 +215,7 @@ do {
             print("Deleted \(name) from CodexRelay")
         default:
             throw RelayError.invalidArguments(
-                "Expected profile login/save/verify/disable/enable/delete <name>, or profile list")
+                "Expected profile login/import-current/save/verify/disable/enable/delete <name>, or profile list")
         }
     case "config" where arguments.count == 3 && arguments[1] == "auto-switch":
         var updatedConfig = try storage.loadConfig()
@@ -222,6 +226,7 @@ do {
         }
         try storage.saveConfig(updatedConfig)
         print("Automatic switching \(updatedConfig.dryRun ? "disabled" : "enabled")")
+    case "refresh": print(try engine.refreshAllQuotas())
     case "check": print(try engine.checkOnce(force: arguments.contains("--force")))
     case "diagnose": print(try engine.diagnose())
     case "run":
