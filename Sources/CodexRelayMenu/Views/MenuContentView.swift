@@ -22,7 +22,10 @@ struct MenuContentView: View {
     private var profiles: [String] { store.config?.profiles ?? [] }
     private var accountListHeight: CGFloat {
         guard !profiles.isEmpty else { return 180 }
-        let groupHeight = CGFloat(profiles.count) * 164
+        let groupHeight = profiles.reduce(CGFloat.zero) { height, profile in
+            let rowCount = max(QuotaWindowPresentation.rows(for: store.accountQuotas[profile]).count, 1)
+            return height + 70 + CGFloat(rowCount) * 47
+        }
         let separators = CGFloat(max(0, profiles.count - 1)) * 22
         let actions = expandedActionsProfile == nil ? 0 : CGFloat(42)
         let topInset = CGFloat(8)
@@ -275,8 +278,13 @@ private struct AccountQuotaGroup: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
-            QuotaProgressRow(title: "5 小时", window: quota?.primary)
-            QuotaProgressRow(title: "7 天", window: quota?.secondary)
+            if quotaRows.isEmpty {
+                QuotaProgressRow(title: "官方额度", window: nil)
+            } else {
+                ForEach(quotaRows) { row in
+                    QuotaProgressRow(title: row.title, window: row.window)
+                }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -330,6 +338,10 @@ private struct AccountQuotaGroup: View {
         return plan.replacingOccurrences(of: "chatgpt", with: "", options: .caseInsensitive)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .capitalized
+    }
+
+    private var quotaRows: [QuotaWindowRow] {
+        QuotaWindowPresentation.rows(for: quota)
     }
 
     private var accountStatus: String {

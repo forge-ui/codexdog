@@ -4,7 +4,7 @@ Native macOS menu bar watchdog for the ChatGPT Codex client. It reads the curren
 
 `CodexRelay.app` owns the watchdog worker. Quitting the menu bar app stops the worker immediately; there is no independent KeepAlive LaunchAgent.
 
-The app is menu-bar-only and uses native SwiftUI Liquid Glass on macOS 26, with a Material fallback on older supported systems. Every account shows the official 5-hour (`300` minutes) and 7-day (`10080` minutes) quota windows, reset time, and last synchronization time. Automatic switching, enrollment, account actions, and destructive confirmation all stay inside the menu-bar panel rather than opening detached modal windows.
+The app is menu-bar-only and uses native SwiftUI Liquid Glass on macOS 26, with a Material fallback on older supported systems. Every account shows the quota windows currently returned by OpenAI, with labels derived from each official window duration, plus reset and last-synchronization times. Automatic switching, enrollment, account actions, and destructive confirmation all stay inside the menu-bar panel rather than opening detached modal windows.
 
 The optional local-usage section reports today and 30-day token/cost estimates for all histories under the current `~/.codex`. Costs are API-equivalent estimates, not ChatGPT subscription charges. Codex session logs do not contain an account identifier, so histories created in a shared `CODEX_HOME` cannot be split reliably by account. An installed CodexBar CLI is used only as the read-only scanner for this section; watchdog, quota synchronization, switching, and recovery remain independent of CodexBar.
 
