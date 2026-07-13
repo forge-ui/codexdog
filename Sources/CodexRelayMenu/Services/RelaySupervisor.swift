@@ -87,14 +87,11 @@ final class RelaySupervisor: @unchecked Sendable {
 
         removeLegacyLaunchAgent(helper: helper)
 
-        let logURL = URL(fileURLWithPath: "/tmp/codex-relay.out.log")
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        }
+        let logURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/CodexRelay/worker.log")
         let handle: FileHandle
         do {
-            handle = try FileHandle(forWritingTo: logURL)
-            try handle.seekToEnd()
+            handle = try Self.prepareLogFile(at: logURL)
         } catch {
             lock.lock()
             starting = false
@@ -154,6 +151,26 @@ final class RelaySupervisor: @unchecked Sendable {
             self.lock.unlock()
         }
         NotificationCenter.default.post(name: .relayWorkerChanged, object: nil)
+    }
+
+    static func prepareLogFile(at logURL: URL) throws -> FileHandle {
+        let manager = FileManager.default
+        let directory = logURL.deletingLastPathComponent()
+        try manager.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        if !manager.fileExists(atPath: logURL.path) {
+            guard manager.createFile(
+                atPath: logURL.path, contents: nil,
+                attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: logURL.path])
+            }
+        }
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logURL.path)
+        let handle = try FileHandle(forWritingTo: logURL)
+        try handle.seekToEnd()
+        return handle
     }
 
     func stop() {

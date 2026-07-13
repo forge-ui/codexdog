@@ -78,9 +78,13 @@ final class RelayStorage: @unchecked Sendable {
     }
 
     @discardableResult
-    func saveCurrentAuth(as profile: String) throws -> Data {
+    func saveCurrentAuth(as profile: String, expectedAccountID: String? = nil) throws -> Data {
         try validate(profile)
         let current = try authSnapshot(at: paths.activeAuth, label: "Current Codex auth")
+        if let expectedAccountID, current.accountID != expectedAccountID {
+            throw RelayError.verification(
+                "Current Codex account changed before profile \(profile) could be saved")
+        }
         let destination = paths.profileAuth(profile)
         if fm.fileExists(atPath: destination.path) {
             let existing = try authSnapshot(at: destination, label: "Profile \(profile) auth")
@@ -120,6 +124,24 @@ final class RelayStorage: @unchecked Sendable {
 
     func restoreAuth(_ data: Data) throws { try atomicWrite(data, to: paths.activeAuth, permissions: 0o600) }
     func profileExists(_ profile: String) -> Bool { fm.fileExists(atPath: paths.profileAuth(profile).path) }
+
+    func validateProfileName(_ profile: String) throws {
+        try validate(profile)
+    }
+
+    func validateCurrentChatGPTAuth() throws -> String {
+        let data = try Data(contentsOf: paths.activeAuth)
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              root["auth_mode"] as? String == "chatgpt",
+              let tokens = root["tokens"] as? [String: Any],
+              let accountID = tokens["account_id"] as? String, !accountID.isEmpty,
+              let accessToken = tokens["access_token"] as? String, !accessToken.isEmpty,
+              let refreshToken = tokens["refresh_token"] as? String, !refreshToken.isEmpty else {
+            throw RelayError.verification(
+                "Current Codex login is not a complete ChatGPT subscription credential")
+        }
+        return accountID
+    }
 
     func activeAccountID() throws -> String {
         try authSnapshot(at: paths.activeAuth, label: "Current Codex auth").accountID

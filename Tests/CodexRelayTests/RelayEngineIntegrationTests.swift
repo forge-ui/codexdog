@@ -17,6 +17,7 @@ private final class FakeChatGPTController: ChatGPTControlling {
         openCount += 1
         isRunning = true
     }
+
 }
 
 private final class FakeRelayBackend: @unchecked Sendable {
@@ -32,6 +33,10 @@ private final class FakeRelayBackend: @unchecked Sendable {
     var throwBeforeRecordingWake = false
     var throwAfterRecordingWake = false
     var waitResultStatus: RecoveryMarkerStatus? = .completed
+    var recoveryThreads = [
+        ThreadRecord(id: "unfinished-thread", preview: nil, cwd: "/tmp",
+                     updatedAt: Int64(Date().timeIntervalSince1970), status: "active")
+    ]
 
     init(storage: RelayStorage, limitsByAccount: [String: RateLimitSnapshot]) {
         self.storage = storage
@@ -80,8 +85,7 @@ private final class FakeAppServer: AppServerServing, @unchecked Sendable {
     }
 
     func listThreads(limit: Int) throws -> [ThreadRecord] {
-        [ThreadRecord(id: "unfinished-thread", preview: nil, cwd: "/tmp",
-                      updatedAt: Int64(Date().timeIntervalSince1970), status: "active")]
+        Array(backend.recoveryThreads.prefix(limit))
     }
 
     func unfinishedThreads(from threads: [ThreadRecord], recentHours: Int, now: Date) -> [ThreadRecord] {
@@ -112,7 +116,7 @@ private final class FakeAppServer: AppServerServing, @unchecked Sendable {
         }
     }
 
-    func waitForTurns(_ threadIDs: Set<String>, timeoutSeconds: Int) -> Set<String> {
+    func waitForTurns(_ entries: [RecoveryEntry], timeoutSeconds: Int) -> Set<String> {
         backend.markerLock.lock()
         if let resultStatus = backend.waitResultStatus {
             for key in Array(backend.recoveryMarkers.keys)
@@ -121,7 +125,7 @@ private final class FakeAppServer: AppServerServing, @unchecked Sendable {
             }
         }
         backend.markerLock.unlock()
-        return threadIDs
+        return Set(entries.map(\.threadId))
     }
 }
 
@@ -145,6 +149,7 @@ private func makeEngineHarness() throws -> EngineHarness {
     let storage = RelayStorage(paths: RelayPaths(
         config: config, rootOverride: root.appendingPathComponent("relay", isDirectory: true)))
     try storage.bootstrap()
+    try storage.saveConfig(config)
 
     try engineTestAuth(accountID: "account-a", token: "a-token")
         .write(to: storage.paths.activeAuth)
@@ -179,6 +184,191 @@ private func finishRecovery(_ harness: EngineHarness) throws {
         _ = try harness.engine.checkOnce()
     }
     Issue.record("Recovery did not finish within the test deadline")
+}
+
+private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCollection {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try decoder.decode(
+        AccountQuotaCollection.self,
+        from: Data(contentsOf: storage.paths.accountQuotas)
+    )
+}
+
+@Test func importsCurrentChatGPTAccountWithoutRestartingTheApp() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.limitsByAccount["account-c"] = RateLimitSnapshot(
+        primary: .init(usedPercent: 12, resetsAt: nil),
+        secondary: .init(usedPercent: 34, resetsAt: nil),
+        reachedReason: nil, planType: "pro"
+    )
+    try engineTestAuth(accountID: "account-c", token: "c-token")
+        .write(to: harness.storage.paths.activeAuth, options: .atomic)
+    let activeAuthBeforeImport = try Data(contentsOf: harness.storage.paths.activeAuth)
+
+    let result = try harness.engine.importCurrentProfile(as: "imported-c")
+    let savedConfig = try harness.storage.loadConfig()
+    let savedState = try harness.storage.loadState()
+    let quotas = try loadAccountQuotas(harness.storage)
+
+    #expect(result.contains("Imported current ChatGPT account"))
+    #expect(savedConfig.profiles == ["a", "b", "imported-c"])
+    #expect(savedState.activeProfile == "imported-c")
+    #expect(try harness.storage.profileAccountID("imported-c") == "account-c")
+    #expect(quotas.accounts["imported-c"]?.primary?.usedPercent == 12)
+    #expect(try Data(contentsOf: harness.storage.paths.activeAuth) == activeAuthBeforeImport)
+    #expect(harness.app.quitCount == 0)
+    #expect(harness.app.openCount == 0)
+}
+
+@Test func importingAnAlreadyManagedAccountRefreshesItWithoutCreatingADuplicate() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try engineTestAuth(accountID: "account-a", token: "rotated-a-token")
+        .write(to: harness.storage.paths.activeAuth, options: .atomic)
+
+    let result = try harness.engine.importCurrentProfile(as: "unused-candidate")
+    let storedAuth = try Data(contentsOf: harness.storage.paths.profileAuth("a"))
+    let savedConfig = try harness.storage.loadConfig()
+    let quotas = try loadAccountQuotas(harness.storage)
+
+    #expect(result.contains("already managed as a"))
+    #expect(!harness.storage.profileExists("unused-candidate"))
+    #expect(savedConfig.profiles == ["a", "b"])
+    #expect(savedConfig.disabledProfiles.isEmpty)
+    #expect(engineTestToken(storedAuth) == "rotated-a-token")
+    #expect(quotas.accounts["a"]?.primary?.usedPercent == 99)
+    #expect(try harness.storage.loadState().activeProfile == "a")
+    #expect(harness.app.quitCount == 0)
+    #expect(harness.app.openCount == 0)
+}
+
+@Test func importingRejectsNonChatGPTCredentialsBeforeCreatingAProfile() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try Data(#"{"auth_mode":"apikey","OPENAI_API_KEY":"test-only"}"#.utf8)
+        .write(to: harness.storage.paths.activeAuth, options: .atomic)
+    let configBeforeImport = try harness.storage.loadConfig()
+    let stateBeforeImport = try harness.storage.loadState()
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.importCurrentProfile(as: "invalid-import")
+    }
+
+    #expect(!harness.storage.profileExists("invalid-import"))
+    #expect(harness.backend.rateLimitCalls.isEmpty)
+    #expect(try harness.storage.loadConfig() == configBeforeImport)
+    #expect(try harness.storage.loadState() == stateBeforeImport)
+}
+
+@Test func failedImportVerificationLeavesNoProfileOrConfigurationEntry() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.limitsByAccount["account-c"] = RateLimitSnapshot(
+        primary: .init(usedPercent: 12, resetsAt: nil), secondary: nil,
+        reachedReason: nil, planType: "pro"
+    )
+    harness.backend.failuresByAccountCall["account-c"] = [
+        1: .rpc("401 Unauthorized: token_invalidated")
+    ]
+    try engineTestAuth(accountID: "account-c", token: "invalid-c-token")
+        .write(to: harness.storage.paths.activeAuth, options: .atomic)
+    let configBeforeImport = try harness.storage.loadConfig()
+    let stateBeforeImport = try harness.storage.loadState()
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.importCurrentProfile(as: "failed-import")
+    }
+
+    #expect(!harness.storage.profileExists("failed-import"))
+    #expect(try harness.storage.loadConfig() == configBeforeImport)
+    #expect(try harness.storage.loadState() == stateBeforeImport)
+    #expect(harness.app.quitCount == 0)
+    #expect(harness.app.openCount == 0)
+}
+
+@Test func manualQuotaRefreshUpdatesEveryProfileWithoutForcingASwitch() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+
+    let result = try harness.engine.refreshAllQuotas()
+    let quotas = try loadAccountQuotas(harness.storage)
+
+    #expect(result.contains("Refreshed 2 profiles"))
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(try harness.storage.loadState().activeProfile == "a")
+    #expect(try harness.storage.loadState().lastSwitchAt == nil)
+    #expect(harness.app.quitCount == 0)
+    #expect(harness.app.openCount == 0)
+    #expect(harness.backend.rateLimitCalls == ["account-a": 1, "account-b": 1])
+    #expect(quotas.accounts["a"]?.primary?.usedPercent == 99)
+    #expect(quotas.accounts["b"]?.primary?.usedPercent == 10)
+}
+
+@Test func manualQuotaRefreshRecordsPerProfileFailureAndKeepsTheActiveAccount() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.failuresByAccountCall["account-b"] = [
+        1: .rpc("503 Service Unavailable")
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.refreshAllQuotas()
+    }
+    let quotas = try loadAccountQuotas(harness.storage)
+
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(harness.app.quitCount == 0)
+    #expect(quotas.accounts["a"]?.primary?.usedPercent == 99)
+    #expect(quotas.accounts["b"]?.error?.contains("503 Service Unavailable") == true)
+}
+
+@Test func failedActiveQuotaRefreshDoesNotOverwriteTheSavedCredential() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let savedCredential = try Data(contentsOf: harness.storage.paths.profileAuth("a"))
+    harness.backend.rotatedTokenByAccountCall["account-a"] = [1: "rotated-invalid-token"]
+    harness.backend.failuresByAccountCall["account-a"] = [
+        1: .rpc("401 Unauthorized: token_invalidated")
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.refreshAllQuotas()
+    }
+
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("a")) == savedCredential)
+    #expect(try Data(contentsOf: harness.storage.paths.activeAuth) != savedCredential)
+}
+
+@Test func transientActiveQuotaFailureStillSavesARotatedCredential() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.rotatedTokenByAccountCall["account-a"] = [1: "rotated-valid-token"]
+    harness.backend.failuresByAccountCall["account-a"] = [
+        1: .rpc("503 Service Unavailable")
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.refreshAllQuotas()
+    }
+
+    #expect(
+        try Data(contentsOf: harness.storage.paths.profileAuth("a"))
+            == Data(contentsOf: harness.storage.paths.activeAuth)
+    )
+}
+
+@Test func successfulQuotaRefreshPreservesAnUnrelatedWatchdogError() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    var state = try harness.storage.loadState()
+    state.lastError = "pending watchdog recovery"
+    try harness.storage.saveState(state)
+
+    _ = try harness.engine.refreshAllQuotas()
+
+    #expect(try harness.storage.loadState().lastError == "pending watchdog recovery")
 }
 
 @Test func engineCommitsSwitchBeforeFinishingRecovery() throws {
@@ -266,6 +456,22 @@ private func finishRecovery(_ harness: EngineHarness) throws {
     #expect(state.failedRecoveryKeys?.isEmpty != false)
 }
 
+@Test func switchContinuesRecoveryThreadsInsideOneChatGPTWindow() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.recoveryThreads = (1...3).map {
+        ThreadRecord(id: "unfinished-thread-\($0)", preview: nil, cwd: "/tmp/\($0)",
+                     updatedAt: Int64(Date().timeIntervalSince1970), status: "active")
+    }
+
+    _ = try harness.engine.checkOnce()
+    Thread.sleep(forTimeInterval: 0.02)
+    _ = try harness.engine.checkOnce()
+
+    #expect(harness.app.openCount == 1)
+    #expect(harness.backend.wakeAttempts.count == 3)
+}
+
 @Test func pendingRecoveryKeepsItsIdentityAcrossAnotherAccountSwitch() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
@@ -308,7 +514,7 @@ private func finishRecovery(_ harness: EngineHarness) throws {
     #expect(harness.backend.wakeAttempts.count == 1)
 }
 
-@Test func interruptedRecoveryHostLeavesPendingStateAndResubmitsTheTurn() throws {
+@Test func inProgressRecoveryTurnIsObservedWithoutDuplicateSubmissionOrFailure() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
     harness.backend.waitResultStatus = nil
@@ -319,8 +525,84 @@ private func finishRecovery(_ harness: EngineHarness) throws {
     #expect(harness.backend.wakeAttempts.count == 1)
 
     _ = try harness.engine.checkOnce()
-    #expect(harness.backend.wakeAttempts.count == 2)
-    #expect(try harness.storage.loadState().pendingSwitch?.phase == .recovering)
+    let observed = try harness.storage.loadState()
+    let key = try #require(observed.pendingSwitch?.snapshot.threads.first?.recoveryKey)
+
+    #expect(harness.backend.wakeAttempts.count == 1)
+    #expect(observed.pendingSwitch?.phase == .recovering)
+    #expect(observed.pendingSwitch?.recoveryAttempts[key] == nil)
+    #expect(observed.failedRecoveryKeys?.contains(key) != true)
+}
+
+@Test func lateCompletedRecoveryIsReconciledBeforeFinalizingTheSwitch() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let entry = RecoveryEntry(
+        threadId: "late-completion-thread", cwd: "/tmp", previousStatus: "active",
+        recoveryKey: "late-completion-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(), createdAt: Date(), sourceProfile: "a", targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil,
+        recoveryAttempts: [entry.recoveryKey: 3]
+    )
+    _ = try harness.storage.activate(profile: "b")
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        failedRecoveryKeys: [entry.recoveryKey],
+        pendingSwitch: transaction
+    ))
+    harness.backend.recoveryMarkers[entry.recoveryKey] = .completed
+
+    _ = try harness.engine.checkOnce()
+    let reconciled = try harness.storage.loadState()
+
+    #expect(reconciled.pendingSwitch == nil)
+    #expect(reconciled.completedRecoveryKeys.contains(entry.recoveryKey))
+    #expect(reconciled.failedRecoveryKeys?.contains(entry.recoveryKey) != true)
+}
+
+@Test func legacyFailedRecoveryIsRetriedAfterTheRecoveryProtocolUpgrade() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.waitResultStatus = nil
+    let entry = RecoveryEntry(
+        threadId: "legacy-failed-thread", cwd: "/tmp", previousStatus: "active",
+        recoveryKey: "legacy-failed-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(), createdAt: Date(), sourceProfile: "a", targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil,
+        recoveryAttempts: [entry.recoveryKey: 3],
+        recoveryProtocolVersion: nil
+    )
+    _ = try harness.storage.activate(profile: "b")
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        failedRecoveryKeys: [entry.recoveryKey],
+        pendingSwitch: transaction
+    ))
+    harness.backend.recoveryMarkers[entry.recoveryKey] = .terminalFailure
+
+    _ = try harness.engine.checkOnce()
+    let retried = try harness.storage.loadState()
+
+    #expect(harness.backend.wakeAttempts == [entry.recoveryKey])
+    #expect(retried.pendingSwitch?.phase == .recovering)
+    #expect(retried.pendingSwitch?.recoveryProtocolVersion == 2)
+    #expect(retried.failedRecoveryKeys?.contains(entry.recoveryKey) != true)
 }
 
 @Test func threeTerminalRecoveryTurnsAreRecordedAsFailedAndStopRetrying() throws {
@@ -356,7 +638,7 @@ private func finishRecovery(_ harness: EngineHarness) throws {
 }
 
 private func engineTestAuth(accountID: String, token: String) -> Data {
-    Data(#"{"tokens":{"account_id":"\#(accountID)","access_token":"\#(token)"}}"#.utf8)
+    Data(#"{"auth_mode":"chatgpt","tokens":{"account_id":"\#(accountID)","access_token":"\#(token)","refresh_token":"refresh-\#(token)","id_token":"id-\#(token)"}}"#.utf8)
 }
 
 private func engineTestToken(_ data: Data) -> String? {

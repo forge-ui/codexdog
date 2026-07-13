@@ -22,10 +22,14 @@ struct MenuContentView: View {
     private var profiles: [String] { store.config?.profiles ?? [] }
     private var accountListHeight: CGFloat {
         guard !profiles.isEmpty else { return 180 }
-        let groupHeight = CGFloat(profiles.count) * 164
+        let groupHeight = profiles.reduce(CGFloat.zero) { height, profile in
+            let rowCount = max(QuotaWindowPresentation.rows(for: store.accountQuotas[profile]).count, 1)
+            return height + 70 + CGFloat(rowCount) * 47
+        }
         let separators = CGFloat(max(0, profiles.count - 1)) * 22
         let actions = expandedActionsProfile == nil ? 0 : CGFloat(42)
-        return min(420, groupHeight + separators + actions)
+        let topInset = CGFloat(8)
+        return min(420, topInset + groupHeight + separators + actions)
     }
 
     var body: some View {
@@ -64,7 +68,7 @@ struct MenuContentView: View {
                                 duplicateDisplayName: store.accountQuotas[profile]?.duplicateOf.map(store.displayName(for:)),
                                 isActive: profile == store.state?.activeProfile,
                                 isScheduled: store.isProfileScheduled(profile),
-                                isCommandRunning: store.commandIsRunning,
+                                isCommandRunning: store.commandIsRunning || store.isRefreshBusy,
                                 actionsExpanded: expandedActionsProfile == profile,
                                 isConfirmingDeletion: confirmingDeletionProfile == profile,
                                 onToggleActions: {
@@ -103,6 +107,7 @@ struct MenuContentView: View {
                         }
                     }
                 }
+                .padding(.top, profiles.isEmpty ? 0 : 8)
             }
             .defaultScrollAnchor(.top)
             .frame(height: accountListHeight)
@@ -115,15 +120,19 @@ struct MenuContentView: View {
                 error: store.localUsageError
             )
 
-            if let error = store.state?.lastError ?? store.message {
+            if !store.visibleErrors.isEmpty {
                 Divider()
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(3)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(store.visibleErrors.enumerated()), id: \.offset) { _, error in
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .lineLimit(3)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
             }
         }
     }
@@ -131,12 +140,13 @@ struct MenuContentView: View {
     private var footer: some View {
         HStack(spacing: 18) {
             Button {
-                store.refresh()
-                store.refreshLocalUsage(force: true)
+                store.manualRefresh()
             } label: {
-                Label("刷新", systemImage: "arrow.clockwise")
+                refreshButtonLabel
             }
             .buttonStyle(.plain)
+            .disabled(store.isRefreshBusy || store.commandIsRunning || showsEnrollment)
+            .help(refreshButtonHelp)
 
             Spacer(minLength: 2)
 
@@ -146,6 +156,7 @@ struct MenuContentView: View {
             ))
             .toggleStyle(.switch)
             .controlSize(.small)
+            .disabled(store.isRefreshBusy || store.commandIsRunning)
 
             Button {
                 NSApp.activate(ignoringOtherApps: true)
@@ -157,6 +168,7 @@ struct MenuContentView: View {
             }
             .buttonStyle(.plain)
             .help(showsEnrollment ? "关闭添加账号" : "添加账号")
+            .disabled(store.isRefreshBusy && !showsEnrollment)
 
             Button {
                 store.quit()
@@ -169,6 +181,33 @@ struct MenuContentView: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
         .background(.ultraThinMaterial)
+    }
+
+    @ViewBuilder
+    private var refreshButtonLabel: some View {
+        switch store.refreshPhase {
+        case .idle:
+            Label("刷新", systemImage: "arrow.clockwise")
+        case .refreshing:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("刷新中")
+            }
+        case .succeeded:
+            Label("已刷新", systemImage: "checkmark")
+        case .failed:
+            Label("失败", systemImage: "exclamationmark.triangle")
+        }
+    }
+
+    private var refreshButtonHelp: String {
+        switch store.refreshPhase {
+        case .idle: "刷新官方额度和本机用量"
+        case .refreshing: "正在刷新官方额度和本机用量"
+        case .succeeded: "刷新完成"
+        case .failed: "刷新失败"
+        }
     }
 }
 
@@ -239,8 +278,13 @@ private struct AccountQuotaGroup: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
-            QuotaProgressRow(title: "5 小时", window: quota?.primary)
-            QuotaProgressRow(title: "7 天", window: quota?.secondary)
+            if quotaRows.isEmpty {
+                QuotaProgressRow(title: "官方额度", window: nil)
+            } else {
+                ForEach(quotaRows) { row in
+                    QuotaProgressRow(title: row.title, window: row.window)
+                }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -249,42 +293,44 @@ private struct AccountQuotaGroup: View {
 
     @ViewBuilder
     private var accountActions: some View {
-        if isConfirmingDeletion {
-            HStack(spacing: 8) {
-                Text("确定删除这个账号？")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Button("取消") { onCancelDelete() }
+        Group {
+            if isConfirmingDeletion {
+                HStack(spacing: 8) {
+                    Text("确定删除这个账号？")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Button("取消") { onCancelDelete() }
+                        .buttonStyle(.bordered)
+                    Button("删除", role: .destructive) { onConfirmDelete() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                }
+                .controlSize(.small)
+            } else {
+                HStack(spacing: 10) {
+                    Button {
+                        onToggleScheduling()
+                    } label: {
+                        Label(
+                            isScheduled ? "关闭调度" : "恢复调度",
+                            systemImage: isScheduled ? "pause.circle" : "play.circle")
+                    }
                     .buttonStyle(.bordered)
-                Button("删除", role: .destructive) { onConfirmDelete() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-            }
-            .controlSize(.small)
-        } else {
-            HStack(spacing: 10) {
-                Button {
-                    onToggleScheduling()
-                } label: {
-                    Label(
-                        isScheduled ? "关闭调度" : "恢复调度",
-                        systemImage: isScheduled ? "pause.circle" : "play.circle")
-                }
-                .buttonStyle(.bordered)
 
-                Spacer(minLength: 4)
+                    Spacer(minLength: 4)
 
-                Button(role: .destructive) {
-                    onRequestDelete()
-                } label: {
-                    Label("删除账号", systemImage: "trash")
+                    Button(role: .destructive) {
+                        onRequestDelete()
+                    } label: {
+                        Label("删除账号", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-            .controlSize(.small)
-            .disabled(isCommandRunning)
         }
+        .disabled(isCommandRunning)
     }
 
     private var planName: String {
@@ -292,6 +338,10 @@ private struct AccountQuotaGroup: View {
         return plan.replacingOccurrences(of: "chatgpt", with: "", options: .caseInsensitive)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .capitalized
+    }
+
+    private var quotaRows: [QuotaWindowRow] {
+        QuotaWindowPresentation.rows(for: quota)
     }
 
     private var accountStatus: String {
@@ -324,6 +374,7 @@ private struct QuotaProgressRow: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
 
             ProgressView(value: Double(remaining ?? 0), total: 100)
                 .progressViewStyle(.linear)
@@ -333,7 +384,7 @@ private struct QuotaProgressRow: View {
 
             HStack(alignment: .firstTextBaseline) {
                 Text(remaining.map { "\($0)% 剩余" } ?? "等待同步")
-                    .foregroundStyle(remaining == nil ? .secondary : .primary)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Text(resetDescription)
                     .foregroundStyle(.secondary)
@@ -347,7 +398,7 @@ private struct QuotaProgressRow: View {
         guard let remaining else { return .secondary }
         if remaining <= 1 { return .red }
         if remaining <= 20 { return .orange }
-        return .primary
+        return Color(nsColor: .secondaryLabelColor).opacity(0.82)
     }
 
     private var resetDescription: String {

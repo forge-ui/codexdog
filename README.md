@@ -4,7 +4,7 @@ Native macOS menu bar watchdog for the ChatGPT Codex client. It reads the curren
 
 `CodexRelay.app` owns the watchdog worker. Quitting the menu bar app stops the worker immediately; there is no independent KeepAlive LaunchAgent.
 
-The app is menu-bar-only and uses native SwiftUI Liquid Glass on macOS 26, with a Material fallback on older supported systems. Every account shows the official 5-hour (`300` minutes) and 7-day (`10080` minutes) quota windows, reset time, and last synchronization time. Automatic switching, enrollment, account actions, and destructive confirmation all stay inside the menu-bar panel rather than opening detached modal windows.
+The app is menu-bar-only and uses native SwiftUI Liquid Glass on macOS 26, with a Material fallback on older supported systems. Every account shows the quota windows currently returned by OpenAI, with labels derived from each official window duration, plus reset and last-synchronization times. Automatic switching, enrollment, account actions, and destructive confirmation all stay inside the menu-bar panel rather than opening detached modal windows.
 
 The optional local-usage section reports today and 30-day token/cost estimates for all histories under the current `~/.codex`. Costs are API-equivalent estimates, not ChatGPT subscription charges. Codex session logs do not contain an account identifier, so histories created in a shared `CODEX_HOME` cannot be split reliably by account. An installed CodexBar CLI is used only as the read-only scanner for this section; watchdog, quota synchronization, switching, and recovery remain independent of CodexBar.
 
@@ -46,9 +46,15 @@ Each account has an actions menu in the upper-right corner:
 - **Pause scheduling** keeps the OAuth credential and last quota snapshot, but excludes the account from automatic rotation and standby quota polling. Resume it from the same menu.
 - **Delete account** removes the credential, cached quota, and rotation entry stored by CodexRelay. It does not delete the OpenAI account or immediately sign the ChatGPT client out of a currently active account.
 
-Each login uses an isolated `CODEX_HOME` and device OAuth. Open the displayed URL and authenticate the requested account. Do not sign out of the ChatGPT desktop app while enrolling profiles: signing out can invalidate the token that was just saved.
+The menu's primary add-account action imports the ChatGPT subscription account already active in the local Codex `auth.json`. Import verifies the live account and official quota first, deduplicates by `account_id`, then atomically saves or refreshes the owner-only profile copy without quitting ChatGPT. Use the secondary device-login action when enrolling a different account; it uses an isolated `CODEX_HOME`, so the current desktop session is left alone.
 
-`profile save` remains available for importing the account currently present in `~/.codex/auth.json`, but isolated login is the recommended path:
+The same import is available from the helper:
+
+```bash
+swift run codex-relay profile import-current account-a
+```
+
+`profile save` remains as a low-level compatibility command, but it skips the live quota verification and deduplication performed by `profile import-current`:
 
 ```bash
 swift run codex-relay profile save account-a
@@ -65,6 +71,7 @@ Edit `~/Library/Application Support/CodexRelay/config.json` when advanced tuning
 This installs the app at `~/Applications/CodexRelay.app`, removes any legacy `com.local.codex-relay` LaunchAgent, and launches the menu bar component. Quitting the component also stops its child watchdog process. Relaunch the app to resume monitoring.
 
 Run `swift run codex-relay diagnose` at any time for a read-only app-server, quota, and recoverable-task check.
+The menu bar refresh button runs `codex-relay refresh`, which synchronizes every account's official quota without forcing an account switch, while the local usage estimate refreshes in parallel.
 
 At a threshold event, the engine checks scheduled profiles in rotation order before closing ChatGPT. Paused, missing, duplicate, or already exhausted profiles are skipped. If none is usable, ChatGPT is left on the current account and the error is shown in the menu bar app.
 
@@ -74,9 +81,11 @@ The switch itself is a persistent transaction: source credentials are backed up 
 
 ## Recovery behavior
 
-CodexRelay preserves `~/.codex` and changes only `auth.json`. It selects active, failed, or recently updated non-archived tasks, resumes them through app-server, and submits a recovery message carrying a stable switch identifier. Before retrying a lost response, it reads the task and searches for that marker; accepted recovery turns are therefore not submitted again merely because a response or local state write was interrupted.
+CodexRelay preserves `~/.codex` and changes only `auth.json`. It selects active, failed, or recently updated non-archived tasks, resumes them through app-server, and submits a recovery message carrying a stable switch identifier. Before retrying a lost response, it reads every matching turn for that marker; a completed recovery remains authoritative even if a later duplicate turn was interrupted.
 
-Recovery is capped at 20 tasks by default and submitted in batches of three, so quota monitoring continues while recovery is in progress. The app-server that owns each submitted turn stays alive until it emits `turn/completed` or reaches its safety timeout; only a completed marker is persisted as recovered. Recovery turns use Codex's risk-evaluating automatic approval reviewer instead of waiting for an unattended menu-bar confirmation; this is not an unconditional approval mode. A task that fails three genuine recovery attempts is recorded separately as failed rather than marked complete. If another switch becomes necessary mid-recovery, pending entries retain their original identifiers.
+Recovery is capped at 20 tasks by default and submitted in batches of three, so quota monitoring continues while recovery is in progress. The app-server that owns each submitted turn polls the exact recovery marker and exits on completion, interruption, a missing-marker grace limit, or its safety timeout; unrelated task activity is not treated as completion. Recovery turns use Codex's risk-evaluating automatic approval reviewer instead of waiting for an unattended menu-bar confirmation; this is not an unconditional approval mode. A task that fails three genuine recovery attempts is recorded separately as failed rather than marked complete. If another switch becomes necessary mid-recovery, pending entries retain their original identifiers.
+
+ChatGPT is reopened once and remains a single macOS window. Recovery turns continue the selected sessions in the background; they stay available from ChatGPT's task list instead of being opened as separate windows. CodexRelay does not require macOS Accessibility permission.
 
 Local development builds are ad-hoc signed automatically. Public distribution requires a Developer ID Application identity, hardened runtime signing, notarization, and stapling. The current SwiftPM build produces an Apple Silicon (`arm64`) app.
 

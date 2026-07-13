@@ -11,7 +11,7 @@ struct AccountEnrollmentPanel: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("添加账号")
                         .font(.system(size: 16, weight: .semibold))
-                    Text("登录完成后自动使用 Codex 邮箱显示账号。")
+                    Text("优先导入当前账号，也可以登录其他账号。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -29,36 +29,64 @@ struct AccountEnrollmentPanel: View {
                 .help("关闭")
             }
 
-            HStack(spacing: 10) {
-                Button("开始登录") {
-                    store.enrollNewAccount()
+            HStack(spacing: 8) {
+                Button {
+                    store.importCurrentAccount()
+                } label: {
+                    Label("导入当前账号", systemImage: "square.and.arrow.down")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(store.commandIsRunning)
+                .disabled(store.commandIsRunning || store.isRefreshBusy)
 
-                if store.commandIsRunning {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("等待登录完成")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Button {
+                    store.enrollNewAccount()
+                } label: {
+                    Label("登录其他账号", systemImage: "person.badge.plus")
                 }
+                .buttonStyle(.bordered)
+                .disabled(store.commandIsRunning || store.isRefreshBusy)
 
                 Spacer()
             }
 
-            VStack(alignment: .leading, spacing: 12) {
-                enrollmentURLRow
-
-                Divider()
-
-                enrollmentCodeRow
+            if store.commandIsRunning {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(store.activeProfileCommand == "import-current"
+                        ? "正在验证当前账号"
+                        : "等待其他账号登录")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            .padding(12)
-            .liquidGlassSurface(cornerRadius: 12)
+
+            enrollmentFeedback
+
+            if showsDeviceLoginDetails {
+                VStack(alignment: .leading, spacing: 12) {
+                    enrollmentURLRow
+
+                    Divider()
+
+                    enrollmentCodeRow
+                }
+                .padding(12)
+                .liquidGlassSurface(cornerRadius: 12)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("读取当前 Codex 已登录的 ChatGPT 订阅账号", systemImage: "person.crop.circle.badge.checkmark")
+                    Text("不会退出或重启 ChatGPT。账号凭据仍保存在 CodexDog 的隔离目录中。")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .liquidGlassSurface(cornerRadius: 12)
+            }
 
             if !store.commandOutput.isEmpty {
-                DisclosureGroup("登录详情", isExpanded: $showsLoginDetails) {
+                DisclosureGroup("操作详情", isExpanded: $showsLoginDetails) {
                     ScrollView {
                         Text(store.commandOutput)
                             .font(.system(size: 10, design: .monospaced))
@@ -82,6 +110,29 @@ struct AccountEnrollmentPanel: View {
         }
         .padding(16)
         .frame(minHeight: 270)
+    }
+
+    @ViewBuilder
+    private var enrollmentFeedback: some View {
+        if let feedback = store.accountEnrollmentFeedback {
+            switch feedback {
+            case .success(let text):
+                Label(text, systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            case .failure(let text):
+                Label(text, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+            }
+        }
+    }
+
+    private var showsDeviceLoginDetails: Bool {
+        store.activeProfileCommand == "login"
+            || store.enrollmentAuthorizationURL != nil
+            || store.enrollmentAuthorizationCode != nil
     }
 
     private var enrollmentURLRow: some View {

@@ -160,26 +160,32 @@ enum SwitchPhase: String, Codable, Equatable, Sendable {
 }
 
 struct SwitchTransaction: Codable, Equatable, Sendable {
+    static let currentRecoveryProtocolVersion = 2
+
     var snapshot: SwitchSnapshot
     var phase: SwitchPhase
     let sourceAccountID: String?
     let targetAccountID: String
     let previousLastSwitchAt: Date?
     var recoveryAttempts: [String: Int] = [:]
+    var recoveryProtocolVersion: Int?
 
     init(snapshot: SwitchSnapshot, phase: SwitchPhase, sourceAccountID: String?,
          targetAccountID: String, previousLastSwitchAt: Date?,
-         recoveryAttempts: [String: Int] = [:]) {
+         recoveryAttempts: [String: Int] = [:],
+         recoveryProtocolVersion: Int? = SwitchTransaction.currentRecoveryProtocolVersion) {
         self.snapshot = snapshot
         self.phase = phase
         self.sourceAccountID = sourceAccountID
         self.targetAccountID = targetAccountID
         self.previousLastSwitchAt = previousLastSwitchAt
         self.recoveryAttempts = recoveryAttempts
+        self.recoveryProtocolVersion = recoveryProtocolVersion
     }
 
     private enum CodingKeys: String, CodingKey {
-        case snapshot, phase, sourceAccountID, targetAccountID, previousLastSwitchAt, recoveryAttempts
+        case snapshot, phase, sourceAccountID, targetAccountID, previousLastSwitchAt
+        case recoveryAttempts, recoveryProtocolVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -190,6 +196,7 @@ struct SwitchTransaction: Codable, Equatable, Sendable {
         targetAccountID = try values.decode(String.self, forKey: .targetAccountID)
         previousLastSwitchAt = try values.decodeIfPresent(Date.self, forKey: .previousLastSwitchAt)
         recoveryAttempts = try values.decodeIfPresent([String: Int].self, forKey: .recoveryAttempts) ?? [:]
+        recoveryProtocolVersion = try values.decodeIfPresent(Int.self, forKey: .recoveryProtocolVersion)
     }
 }
 

@@ -90,18 +90,82 @@ struct LocalUsageSummaryView: View {
 private struct LocalUsageBars: View {
     let days: [LocalUsageDay]
 
+    @State private var hover: HoverSelection?
+
+    private let barSpacing: CGFloat = 2
     private var visibleDays: [LocalUsageDay] { Array(days.suffix(30)) }
     private var maximum: Double { max(visibleDays.map(\.totalCost).max() ?? 0, 0.01) }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 2) {
-            ForEach(visibleDays) { day in
-                Capsule()
-                    .fill(.primary.opacity(day.id == visibleDays.last?.id ? 0.85 : 0.28))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: max(3, 35 * day.totalCost / maximum))
-                    .help("\(day.date) · \(day.totalCost.formatted(.currency(code: "USD").precision(.fractionLength(2))))")
+        GeometryReader { proxy in
+            ZStack(alignment: .topLeading) {
+                Color.clear
+
+                HStack(alignment: .bottom, spacing: barSpacing) {
+                    ForEach(Array(visibleDays.enumerated()), id: \.element.id) { index, day in
+                        Capsule()
+                            .fill(.primary.opacity(barOpacity(for: index, day: day)))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: max(3, proxy.size.height * day.totalCost / maximum))
+                            .accessibilityLabel(day.date)
+                            .accessibilityValue(cost(day))
+                    }
+                }
+
+                if let hover, visibleDays.indices.contains(hover.index) {
+                    Text("\(visibleDays[hover.index].date) · \(cost(visibleDays[hover.index]))")
+                        .font(.system(size: 10, weight: .medium))
+                        .monospacedDigit()
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(.primary.opacity(0.12), lineWidth: 0.5)
+                        }
+                        .fixedSize()
+                        .position(x: tooltipX(for: hover.x, width: proxy.size.width), y: 11)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hover = hoverSelection(at: location.x, width: proxy.size.width)
+                case .ended:
+                    hover = nil
+                }
             }
         }
+    }
+
+    private func hoverSelection(at x: CGFloat, width: CGFloat) -> HoverSelection? {
+        guard !visibleDays.isEmpty, width > 0, x >= 0, x <= width else { return nil }
+        let totalSpacing = barSpacing * CGFloat(max(visibleDays.count - 1, 0))
+        let barWidth = max((width - totalSpacing) / CGFloat(visibleDays.count), 0)
+        let slotWidth = max(barWidth + barSpacing, 1)
+        let index = min(Int(x / slotWidth), visibleDays.count - 1)
+        return HoverSelection(index: index, x: x)
+    }
+
+    private func barOpacity(for index: Int, day: LocalUsageDay) -> Double {
+        if hover?.index == index { return 0.72 }
+        return day.id == visibleDays.last?.id ? 0.85 : 0.28
+    }
+
+    private func cost(_ day: LocalUsageDay) -> String {
+        day.totalCost.formatted(.currency(code: "USD").precision(.fractionLength(2)))
+    }
+
+    private func tooltipX(for pointerX: CGFloat, width: CGFloat) -> CGFloat {
+        let halfWidth: CGFloat = 76
+        guard width > halfWidth * 2 else { return width / 2 }
+        return min(max(pointerX, halfWidth), width - halfWidth)
+    }
+
+    private struct HoverSelection: Equatable {
+        let index: Int
+        let x: CGFloat
     }
 }
