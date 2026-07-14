@@ -19,6 +19,39 @@ private actor RefreshGate {
     }
 }
 
+private actor LocalUsageFetchCounter {
+    private var calls = 0
+    private let snapshot: LocalUsageSnapshot
+
+    init(snapshot: LocalUsageSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func fetch() -> LocalUsageSnapshot {
+        calls += 1
+        return snapshot
+    }
+
+    func callCount() -> Int { calls }
+}
+
+private final class TestDateSource: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date
+
+    init(_ date: Date) {
+        self.date = date
+    }
+
+    func now() -> Date {
+        lock.withLock { date }
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.withLock { date.addTimeInterval(interval) }
+    }
+}
+
 private enum RefreshTestError: LocalizedError {
     case unavailable
 
@@ -29,6 +62,108 @@ private enum RefreshTestError: LocalizedError {
     #expect(RelayQuotaRefreshService.timeoutSeconds(profileCount: 0) == 150)
     #expect(RelayQuotaRefreshService.timeoutSeconds(profileCount: 2) == 225)
     #expect(RelayQuotaRefreshService.timeoutSeconds(profileCount: 10) == 825)
+}
+
+@MainActor
+@Test func localUsageRefreshBecomesDueAfterTwentyMinutes() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let clock = TestDateSource(Date(timeIntervalSince1970: 1_000))
+    let usage = LocalUsageSnapshot(
+        provider: "codex", source: "test", updatedAt: "now",
+        sessionCostUSD: 0, sessionTokens: 0,
+        last30DaysCostUSD: 0, last30DaysTokens: 0, daily: []
+    )
+    let fetchCounter = LocalUsageFetchCounter(snapshot: usage)
+    let store = RelayMenuStore(
+        startSupervisor: false,
+        loadLocalUsage: false,
+        startPolling: false,
+        rootURL: root,
+        dateProvider: { clock.now() },
+        localUsageFetcher: { await fetchCounter.fetch() }
+    )
+    defer {
+        store.shutdown()
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    store.refreshLocalUsage(force: true)
+    for _ in 0..<100 {
+        if await fetchCounter.callCount() == 1, !store.localUsageIsLoading { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await fetchCounter.callCount() == 1)
+
+    clock.advance(by: 1_199)
+    store.refreshLocalUsage()
+    try await Task.sleep(for: .milliseconds(10))
+    #expect(await fetchCounter.callCount() == 1)
+
+    clock.advance(by: 1)
+    store.refreshLocalUsage()
+    for _ in 0..<100 {
+        if await fetchCounter.callCount() == 2 { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await fetchCounter.callCount() == 2)
+}
+
+@MainActor
+@Test func manualRefreshRunsImmediatelyAndRestartsTheTwentyMinuteWindow() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let clock = TestDateSource(Date(timeIntervalSince1970: 2_000))
+    let usage = LocalUsageSnapshot(
+        provider: "codex", source: "test", updatedAt: "now",
+        sessionCostUSD: 0, sessionTokens: 0,
+        last30DaysCostUSD: 0, last30DaysTokens: 0, daily: []
+    )
+    let fetchCounter = LocalUsageFetchCounter(snapshot: usage)
+    let store = RelayMenuStore(
+        startSupervisor: false,
+        loadLocalUsage: false,
+        startPolling: false,
+        rootURL: root,
+        refreshTiming: MenuRefreshTiming(
+            minimumVisibleDuration: .milliseconds(1),
+            resultVisibleDuration: .milliseconds(1)
+        ),
+        dateProvider: { clock.now() },
+        localUsageFetcher: { await fetchCounter.fetch() },
+        officialQuotaRefresher: { _ in }
+    )
+    defer {
+        store.shutdown()
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    store.refreshLocalUsage(force: true)
+    for _ in 0..<100 {
+        if await fetchCounter.callCount() == 1, !store.localUsageIsLoading { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    clock.advance(by: 300)
+    store.manualRefresh()
+    for _ in 0..<100 {
+        if await fetchCounter.callCount() == 2, !store.localUsageIsLoading { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await fetchCounter.callCount() == 2)
+
+    clock.advance(by: 1_199)
+    store.refreshLocalUsage()
+    try await Task.sleep(for: .milliseconds(10))
+    #expect(await fetchCounter.callCount() == 2)
+
+    clock.advance(by: 1)
+    store.refreshLocalUsage()
+    for _ in 0..<100 {
+        if await fetchCounter.callCount() == 3 { break }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await fetchCounter.callCount() == 3)
 }
 
 @MainActor

@@ -16,6 +16,7 @@ enum AccountEnrollmentFeedback: Equatable {
 
 typealias LocalUsageFetcher = @Sendable () async throws -> LocalUsageSnapshot
 typealias OfficialQuotaRefresher = @Sendable (_ profileCount: Int) async throws -> Void
+typealias MenuDateProvider = @Sendable () -> Date
 
 struct MenuRefreshTiming: Sendable {
     let minimumVisibleDuration: Duration
@@ -52,6 +53,9 @@ final class RelayMenuStore: ObservableObject {
     private let localUsageFetcher: LocalUsageFetcher
     private let officialQuotaRefresher: OfficialQuotaRefresher
     private let refreshTiming: MenuRefreshTiming
+    private let localUsageRefreshInterval: TimeInterval
+    private let dateProvider: MenuDateProvider
+    private let automaticallyRefreshLocalUsage: Bool
     private var timer: Timer?
     private var commandProcess: Process?
     private var rawCommandOutput = ""
@@ -70,6 +74,8 @@ final class RelayMenuStore: ObservableObject {
         startPolling: Bool = true,
         rootURL: URL? = nil,
         refreshTiming: MenuRefreshTiming = .standard,
+        localUsageRefreshInterval: TimeInterval = 20 * 60,
+        dateProvider: @escaping MenuDateProvider = Date.init,
         localUsageFetcher: @escaping LocalUsageFetcher = { try await LocalUsageService.fetch() },
         officialQuotaRefresher: @escaping OfficialQuotaRefresher = { profileCount in
             try await RelayQuotaRefreshService.refresh(profileCount: profileCount)
@@ -78,6 +84,9 @@ final class RelayMenuStore: ObservableObject {
         self.rootURL = rootURL ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/CodexRelay", isDirectory: true)
         self.refreshTiming = refreshTiming
+        self.localUsageRefreshInterval = localUsageRefreshInterval
+        self.dateProvider = dateProvider
+        self.automaticallyRefreshLocalUsage = loadLocalUsage
         self.localUsageFetcher = localUsageFetcher
         self.officialQuotaRefresher = officialQuotaRefresher
         refresh()
@@ -91,7 +100,13 @@ final class RelayMenuStore: ObservableObject {
         refresh()
         if startPolling {
             timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.refresh() }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.refresh()
+                    if self.automaticallyRefreshLocalUsage {
+                        self.refreshLocalUsage()
+                    }
+                }
             }
             NotificationCenter.default.addObserver(
                 forName: .relayWorkerChanged, object: nil, queue: .main
@@ -217,18 +232,19 @@ final class RelayMenuStore: ObservableObject {
     func refreshLocalUsage(force: Bool = false) {
         if !force,
            let lastLocalUsageRefresh,
-           Date().timeIntervalSince(lastLocalUsageRefresh) < 60 {
+           dateProvider().timeIntervalSince(lastLocalUsageRefresh) < localUsageRefreshInterval {
             return
         }
         guard localUsageTask == nil else { return }
 
         localUsageIsLoading = true
         let fetcher = localUsageFetcher
+        let dateProvider = dateProvider
         localUsageTask = Task { [weak self] in
             defer {
                 self?.localUsageIsLoading = false
                 self?.localUsageTask = nil
-                self?.lastLocalUsageRefresh = Date()
+                self?.lastLocalUsageRefresh = dateProvider()
             }
             do {
                 self?.localUsage = try await fetcher()
