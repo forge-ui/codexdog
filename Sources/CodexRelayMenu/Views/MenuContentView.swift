@@ -24,7 +24,7 @@ struct MenuContentView: View {
         guard !profiles.isEmpty else { return 180 }
         let groupHeight = profiles.reduce(CGFloat.zero) { height, profile in
             let rowCount = max(QuotaWindowPresentation.rows(for: store.accountQuotas[profile]).count, 1)
-            return height + 70 + CGFloat(rowCount) * 47
+            return height + 70 + CGFloat(rowCount) * 59
         }
         let separators = CGFloat(max(0, profiles.count - 1)) * 22
         let actions = expandedActionsProfile == nil ? 0 : CGFloat(42)
@@ -279,10 +279,14 @@ private struct AccountQuotaGroup: View {
             }
 
             if quotaRows.isEmpty {
-                QuotaProgressRow(title: "官方额度", window: nil)
+                QuotaProgressRow(title: "官方额度", window: nil, sampledAt: nil)
             } else {
                 ForEach(quotaRows) { row in
-                    QuotaProgressRow(title: row.title, window: row.window)
+                    QuotaProgressRow(
+                        title: row.title,
+                        window: row.window,
+                        sampledAt: quota?.updatedAt
+                    )
                 }
             }
         }
@@ -365,6 +369,7 @@ private struct AccountQuotaGroup: View {
 private struct QuotaProgressRow: View {
     let title: String
     let window: MenuQuotaWindow?
+    let sampledAt: Date?
 
     private var remaining: Int? {
         window.map { max(0, min(100, 100 - $0.usedPercent)) }
@@ -391,6 +396,20 @@ private struct QuotaProgressRow: View {
             }
             .font(.system(size: 10, weight: .regular))
             .monospacedDigit()
+
+            TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                if let paceDescription = QuotaWindowPresentation.paceDescription(
+                    for: window,
+                    sampledAt: sampledAt,
+                    now: timeline.date
+                ) {
+                    Text(paceDescription)
+                        .font(.system(size: 9, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            }
         }
     }
 

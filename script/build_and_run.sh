@@ -103,7 +103,7 @@ verify_running_app() {
   [[ "$parent" == "$menu_pid" ]]
   version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
   build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-  [[ "$version" == "0.7.0" && "$build" == "9" ]]
+  [[ "$version" == "0.7.1" && "$build" == "10" ]]
   echo "CodexRelay.app $version ($build) is running"
 }
 

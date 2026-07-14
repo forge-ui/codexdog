@@ -28,7 +28,8 @@ struct LocalUsageSummaryView: View {
                     .frame(height: 35)
 
                 HStack(spacing: 5) {
-                    Text("最常用模型：\(usage.mostUsedModel ?? "—")")
+                    Text("统计时间：\(LocalUsagePresentation.statisticsTime(usage.updatedAt))")
+                        .monospacedDigit()
                     Spacer()
                     Text("本机 Codex 日志 · API 等值")
                 }
