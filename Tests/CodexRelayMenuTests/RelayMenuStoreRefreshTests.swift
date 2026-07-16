@@ -65,7 +65,7 @@ private enum RefreshTestError: LocalizedError {
 }
 
 @MainActor
-@Test func localUsageRefreshBecomesDueAfterTwentyMinutes() async throws {
+@Test func localUsageRefreshBecomesDueAfterThirtyMinutes() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let clock = TestDateSource(Date(timeIntervalSince1970: 1_000))
@@ -95,7 +95,7 @@ private enum RefreshTestError: LocalizedError {
     }
     #expect(await fetchCounter.callCount() == 1)
 
-    clock.advance(by: 1_199)
+    clock.advance(by: 1_799)
     store.refreshLocalUsage()
     try await Task.sleep(for: .milliseconds(10))
     #expect(await fetchCounter.callCount() == 1)
@@ -110,7 +110,7 @@ private enum RefreshTestError: LocalizedError {
 }
 
 @MainActor
-@Test func manualRefreshRunsImmediatelyAndRestartsTheTwentyMinuteWindow() async throws {
+@Test func manualRefreshRunsImmediatelyAndRestartsTheThirtyMinuteWindow() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let clock = TestDateSource(Date(timeIntervalSince1970: 2_000))
@@ -152,7 +152,7 @@ private enum RefreshTestError: LocalizedError {
     }
     #expect(await fetchCounter.callCount() == 2)
 
-    clock.advance(by: 1_199)
+    clock.advance(by: 1_799)
     store.refreshLocalUsage()
     try await Task.sleep(for: .milliseconds(10))
     #expect(await fetchCounter.callCount() == 2)

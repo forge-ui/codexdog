@@ -74,7 +74,7 @@ final class RelayMenuStore: ObservableObject {
         startPolling: Bool = true,
         rootURL: URL? = nil,
         refreshTiming: MenuRefreshTiming = .standard,
-        localUsageRefreshInterval: TimeInterval = 20 * 60,
+        localUsageRefreshInterval: TimeInterval = 30 * 60,
         dateProvider: @escaping MenuDateProvider = Date.init,
         localUsageFetcher: @escaping LocalUsageFetcher = { try await LocalUsageService.fetch() },
         officialQuotaRefresher: @escaping OfficialQuotaRefresher = { profileCount in

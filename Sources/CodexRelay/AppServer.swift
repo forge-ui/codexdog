@@ -36,7 +36,7 @@ final class AppServerClient: @unchecked Sendable {
         try? error.fileHandleForWriting.close()
         do {
             _ = try request("initialize", params: .object([
-                "clientInfo": .object(["name": .string("codex-relay"), "title": .string("CodexRelay"), "version": .string("0.7.1")]),
+                "clientInfo": .object(["name": .string("codex-relay"), "title": .string("CodexRelay"), "version": .string("0.7.2")]),
                 "capabilities": .object(["experimentalApi": .bool(true)])
             ]))
             try notify("initialized", params: .object([:]))

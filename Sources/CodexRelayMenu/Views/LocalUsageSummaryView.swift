@@ -19,9 +19,9 @@ struct LocalUsageSummaryView: View {
             if let usage {
                 HStack(spacing: 16) {
                     usageMetric("今日", value: currency(usage.sessionCostUSD))
+                    usageMetric("今日用量", value: compact(usage.sessionTokens))
                     usageMetric("近 30 天", value: currency(usage.last30DaysCostUSD))
                     usageMetric("30 天 token", value: compact(usage.last30DaysTokens))
-                    usageMetric("最近 token", value: compact(usage.sessionTokens))
                 }
 
                 LocalUsageBars(days: usage.daily)
