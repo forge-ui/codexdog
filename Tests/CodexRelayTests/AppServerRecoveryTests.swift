@@ -2,6 +2,15 @@ import Foundation
 import Testing
 @testable import CodexRelay
 
+@Test func recoveryWakeMessageKeepsOnlyOneVisibleInstruction() {
+    let message = AppServerClient.recoveryMessage(recoveryKey: "recovery-test-key")
+
+    #expect(message == "请按原计划继续未完成的任务。\n<!-- codex-relay-recovery:recovery-test-key -->")
+    #expect(message.contains("recovery-test-key"))
+    #expect(!message.contains("previous account"))
+    #expect(!message.contains("persisted thread state"))
+}
+
 @Test func recoveryMarkerStatusPrefersCompletedAcrossDuplicateMatchingTurns() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -15,7 +24,7 @@ import Testing
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
           ;;
         *'thread'*'read'*)
-          printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"turns":[{"status":"completed","items":[{"type":"userMessage","content":[{"type":"text","text":"recovery-test-key"}]}]},{"status":"interrupted","items":[{"type":"userMessage","content":[{"type":"text","text":"recovery-test-key"}]}]}]}}}'
+          printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"turns":[{"status":"completed","items":[{"type":"userMessage","content":[{"type":"text","text":"<!-- codex-relay-recovery:recovery-test-key -->"}]}]},{"status":"interrupted","items":[{"type":"userMessage","content":[{"type":"text","text":"<!-- codex-relay-recovery:recovery-test-key -->"}]}]}]}}}'
           ;;
       esac
     done

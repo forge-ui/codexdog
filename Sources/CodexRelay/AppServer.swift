@@ -36,7 +36,7 @@ final class AppServerClient: @unchecked Sendable {
         try? error.fileHandleForWriting.close()
         do {
             _ = try request("initialize", params: .object([
-                "clientInfo": .object(["name": .string("codex-relay"), "title": .string("CodexRelay"), "version": .string("0.8.0")]),
+                "clientInfo": .object(["name": .string("codex-relay"), "title": .string("CodexRelay"), "version": .string("0.8.1")]),
                 "capabilities": .object(["experimentalApi": .bool(true)])
             ]))
             try notify("initialized", params: .object([:]))
@@ -164,15 +164,17 @@ final class AppServerClient: @unchecked Sendable {
 
     func resumeAndWake(_ entry: RecoveryEntry) throws {
         _ = try request("thread/resume", params: .object(["threadId": .string(entry.threadId)]))
-        let message = """
-        CodexRelay automatic recovery \(entry.recoveryKey). The previous account exhausted its allowance. Continue the unfinished task from the persisted thread state. Inspect the working tree and the latest turn before acting; do not repeat completed side effects. If the task is already complete or requires user input, report that and stop.
-        """
+        let message = Self.recoveryMessage(recoveryKey: entry.recoveryKey)
         _ = try request("turn/start", params: .object([
             "threadId": .string(entry.threadId),
             "clientUserMessageId": .string(entry.recoveryKey),
             "approvalsReviewer": .string("auto_review"),
             "input": .array([.object(["type": .string("text"), "text": .string(message), "text_elements": .array([])])])
         ]))
+    }
+
+    static func recoveryMessage(recoveryKey: String) -> String {
+        "请按原计划继续未完成的任务。\n<!-- codex-relay-recovery:\(recoveryKey) -->"
     }
 
     func recoveryMarkerStatus(_ entry: RecoveryEntry) throws -> RecoveryMarkerStatus {
