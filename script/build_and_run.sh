@@ -10,6 +10,11 @@ stage_app() {
   /usr/bin/ditto ".build/$configuration/CodexRelayMenu" "$destination/Contents/MacOS/CodexRelayMenu"
   /usr/bin/ditto ".build/$configuration/codex-relay" "$destination/Contents/MacOS/codex-relay"
   /usr/bin/ditto "Support/CodexRelay-Info.plist" "$destination/Contents/Info.plist"
+  mkdir -p "$destination/Contents/Resources/ThirdPartyNotices"
+  /usr/bin/ditto "THIRD_PARTY_NOTICES.md" "$destination/Contents/Resources/THIRD_PARTY_NOTICES.md"
+  /usr/bin/ditto \
+    "ThirdPartyNotices/CodexBar-LICENSE.txt" \
+    "$destination/Contents/Resources/ThirdPartyNotices/CodexBar-LICENSE.txt"
   build_icon "$destination/Contents/Resources/AppIcon.icns"
   chmod 755 "$destination/Contents/MacOS/CodexRelayMenu" "$destination/Contents/MacOS/codex-relay"
   sign_app "$destination"
@@ -103,7 +108,7 @@ verify_running_app() {
   [[ "$parent" == "$menu_pid" ]]
   version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
   build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-  [[ "$version" == "0.7.2" && "$build" == "11" ]]
+  [[ "$version" == "0.8.0" && "$build" == "12" ]]
   echo "CodexRelay.app $version ($build) is running"
 }
 

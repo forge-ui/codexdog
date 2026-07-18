@@ -27,3 +27,11 @@ import Testing
 @Test func invalidLocalUsageStatisticsTimeFallsBackToPlaceholder() {
     #expect(LocalUsagePresentation.statisticsTime("not-a-date") == "—")
 }
+
+@Test func localUsageTokenCountsUseTheSameCompactFormatEverywhere() {
+    #expect(LocalUsagePresentation.compactTokens(nil) == "—")
+    #expect(LocalUsagePresentation.compactTokens(999) == "999")
+    #expect(LocalUsagePresentation.compactTokens(1_250) == "1K")
+    #expect(LocalUsagePresentation.compactTokens(15_600_000) == "16M")
+    #expect(LocalUsagePresentation.compactTokens(1_850_000_000) == "1.9B")
+}

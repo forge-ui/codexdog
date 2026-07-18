@@ -10,8 +10,19 @@ let package = Package(
     ],
     targets: [
         .executableTarget(name: "CodexRelay"),
-        .executableTarget(name: "CodexRelayMenu"),
+        .target(
+            name: "CodexUsageCore",
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
+        .executableTarget(
+            name: "CodexRelayMenu",
+            dependencies: ["CodexUsageCore"]
+        ),
         .testTarget(name: "CodexRelayTests", dependencies: ["CodexRelay"]),
-        .testTarget(name: "CodexRelayMenuTests", dependencies: ["CodexRelayMenu"]),
+        .testTarget(
+            name: "CodexRelayMenuTests",
+            dependencies: ["CodexRelayMenu", "CodexUsageCore"]
+        ),
+        .testTarget(name: "CodexUsageCoreTests", dependencies: ["CodexUsageCore"]),
     ]
 )

@@ -174,7 +174,9 @@ final class RelayMenuStore: ObservableObject {
             await minimumDelay.value
 
             guard let self else { return }
-            while self.localUsageTask != nil, !Task.isCancelled {
+            while self.localUsageTask != nil,
+                  !Task.isCancelled
+            {
                 try? await Task.sleep(for: .milliseconds(50))
             }
             guard !Task.isCancelled else {
@@ -394,7 +396,6 @@ final class RelayMenuStore: ObservableObject {
         refreshPhase = .idle
         localUsageTask?.cancel()
         localUsageTask = nil
-        LocalUsageProcessRegistry.shared.stop()
         RelayQuotaRefreshProcessRegistry.shared.stop()
         terminateCommandProcessTree()
         supervisor.stop()

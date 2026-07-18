@@ -1,6 +1,21 @@
 import Foundation
 
 enum LocalUsagePresentation {
+    static func compactTokens(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        let number = Double(value)
+        if number >= 1_000_000_000 {
+            return String(format: "%.1fB", number / 1_000_000_000)
+        }
+        if number >= 1_000_000 {
+            return String(format: "%.0fM", number / 1_000_000)
+        }
+        if number >= 1_000 {
+            return String(format: "%.0fK", number / 1_000)
+        }
+        return String(value)
+    }
+
     static func statisticsTime(
         _ timestamp: String,
         timeZone: TimeZone = .current

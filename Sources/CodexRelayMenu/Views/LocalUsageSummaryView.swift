@@ -19,9 +19,9 @@ struct LocalUsageSummaryView: View {
             if let usage {
                 HStack(spacing: 16) {
                     usageMetric("今日", value: currency(usage.sessionCostUSD))
-                    usageMetric("今日用量", value: compact(usage.sessionTokens))
+                    usageMetric("今日用量", value: LocalUsagePresentation.compactTokens(usage.sessionTokens))
                     usageMetric("近 30 天", value: currency(usage.last30DaysCostUSD))
-                    usageMetric("30 天 token", value: compact(usage.last30DaysTokens))
+                    usageMetric("30 天 token", value: LocalUsagePresentation.compactTokens(usage.last30DaysTokens))
                 }
 
                 LocalUsageBars(days: usage.daily)
@@ -72,20 +72,6 @@ struct LocalUsageSummaryView: View {
         return value.formatted(.currency(code: "USD").precision(.fractionLength(2)))
     }
 
-    private func compact(_ value: Int64?) -> String {
-        guard let value else { return "—" }
-        let number = Double(value)
-        if number >= 1_000_000_000 {
-            return String(format: "%.1fB", number / 1_000_000_000)
-        }
-        if number >= 1_000_000 {
-            return String(format: "%.0fM", number / 1_000_000)
-        }
-        if number >= 1_000 {
-            return String(format: "%.0fK", number / 1_000)
-        }
-        return String(value)
-    }
 }
 
 private struct LocalUsageBars: View {
@@ -109,12 +95,13 @@ private struct LocalUsageBars: View {
                             .frame(maxWidth: .infinity)
                             .frame(height: max(3, proxy.size.height * day.totalCost / maximum))
                             .accessibilityLabel(day.date)
-                            .accessibilityValue(cost(day))
+                            .accessibilityValue("\(cost(day))，\(tokens(day)) token")
                     }
                 }
 
                 if let hover, visibleDays.indices.contains(hover.index) {
-                    Text("\(visibleDays[hover.index].date) · \(cost(visibleDays[hover.index]))")
+                    let day = visibleDays[hover.index]
+                    Text("\(day.date) · \(cost(day)) · \(tokens(day)) token")
                         .font(.system(size: 10, weight: .medium))
                         .monospacedDigit()
                         .padding(.horizontal, 8)
@@ -159,8 +146,12 @@ private struct LocalUsageBars: View {
         day.totalCost.formatted(.currency(code: "USD").precision(.fractionLength(2)))
     }
 
+    private func tokens(_ day: LocalUsageDay) -> String {
+        LocalUsagePresentation.compactTokens(day.totalTokens)
+    }
+
     private func tooltipX(for pointerX: CGFloat, width: CGFloat) -> CGFloat {
-        let halfWidth: CGFloat = 76
+        let halfWidth: CGFloat = 116
         guard width > halfWidth * 2 else { return width / 2 }
         return min(max(pointerX, halfWidth), width - halfWidth)
     }

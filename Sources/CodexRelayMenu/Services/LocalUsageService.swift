@@ -1,126 +1,88 @@
+import CodexUsageCore
 import Foundation
-import Darwin
-
-final class LocalUsageProcessRegistry: @unchecked Sendable {
-    static let shared = LocalUsageProcessRegistry()
-
-    private let lock = NSLock()
-    private var process: Process?
-
-    private init() {}
-
-    func register(_ process: Process) {
-        lock.lock()
-        self.process = process
-        lock.unlock()
-    }
-
-    func unregister(_ process: Process) {
-        lock.lock()
-        if self.process === process { self.process = nil }
-        lock.unlock()
-    }
-
-    func stop() {
-        lock.lock()
-        let active = process
-        process = nil
-        lock.unlock()
-        guard let active, active.isRunning else { return }
-        active.terminate()
-        let deadline = Date().addingTimeInterval(1)
-        while active.isRunning, Date() < deadline {
-            Darwin.usleep(50_000)
-        }
-        if active.isRunning { Darwin.kill(active.processIdentifier, SIGKILL) }
-        active.waitUntilExit()
-    }
-}
 
 enum LocalUsageServiceError: LocalizedError {
-    case scannerUnavailable
     case scannerFailed(String)
-    case emptyResult
 
     var errorDescription: String? {
         switch self {
-        case .scannerUnavailable:
-            return "未找到本机用量扫描器"
         case .scannerFailed(let message):
             return message.isEmpty ? "本机用量扫描失败" : message
-        case .emptyResult:
-            return "没有读取到本机用量"
         }
     }
 }
 
 struct LocalUsageService {
     static func fetch() async throws -> LocalUsageSnapshot {
-        guard let executable = executableURL() else {
-            throw LocalUsageServiceError.scannerUnavailable
+        let scanTask = Task.detached(priority: .utility) {
+            try CodexUsageClient.scan(historyDays: 30)
         }
 
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        process.executableURL = executable
-        process.arguments = ["cost", "--provider", "codex", "--format", "json"]
-        process.standardOutput = output
-        process.standardError = errors
-
-        try process.run()
-        LocalUsageProcessRegistry.shared.register(process)
-        defer { LocalUsageProcessRegistry.shared.unregister(process) }
-        let outputTask = Task.detached {
-            output.fileHandleForReading.readDataToEndOfFile()
-        }
-        let errorTask = Task.detached {
-            errors.fileHandleForReading.readDataToEndOfFile()
-        }
         do {
-            let timeout = Date().addingTimeInterval(120)
-            while process.isRunning {
-                try Task.checkCancellation()
-                guard Date() < timeout else {
-                    throw LocalUsageServiceError.scannerFailed("本机用量扫描超时")
+            let scanned = try await withTaskCancellationHandler {
+                try await withThrowingTaskGroup(of: CodexUsageSnapshot.self) { group in
+                    group.addTask {
+                        try await withTaskCancellationHandler {
+                            try await scanTask.value
+                        } onCancel: {
+                            scanTask.cancel()
+                        }
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: .seconds(15 * 60))
+                        throw LocalUsageServiceError.scannerFailed("本机用量扫描超过 15 分钟")
+                    }
+                    guard let first = try await group.next() else {
+                        throw LocalUsageServiceError.scannerFailed("没有读取到本机用量")
+                    }
+                    group.cancelAll()
+                    return first
                 }
-                try await Task.sleep(for: .milliseconds(100))
+            } onCancel: {
+                scanTask.cancel()
             }
-        } catch {
-            terminate(process)
-            _ = await outputTask.value
-            _ = await errorTask.value
+            scanTask.cancel()
+            return map(scanned)
+        } catch is CancellationError {
+            scanTask.cancel()
+            throw CancellationError()
+        } catch let error as LocalUsageServiceError {
+            scanTask.cancel()
             throw error
+        } catch {
+            scanTask.cancel()
+            throw LocalUsageServiceError.scannerFailed(error.localizedDescription)
         }
-        process.waitUntilExit()
-        let data = await outputTask.value
-        let errorData = await errorTask.value
-
-        guard process.terminationStatus == 0 else {
-            let message = String(data: errorData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            throw LocalUsageServiceError.scannerFailed(message)
-        }
-
-        let results = try JSONDecoder().decode([LocalUsageSnapshot].self, from: data)
-        guard let snapshot = results.first(where: { $0.provider == "codex" }) else {
-            throw LocalUsageServiceError.emptyResult
-        }
-        return snapshot
     }
 
-    private static func terminate(_ process: Process) {
-        LocalUsageProcessRegistry.shared.stop()
+    private static func map(_ snapshot: CodexUsageSnapshot) -> LocalUsageSnapshot {
+        LocalUsageSnapshot(
+            provider: "codex",
+            source: "codexdog-local",
+            updatedAt: iso8601(snapshot.updatedAt),
+            sessionCostUSD: snapshot.todayCostUSD,
+            sessionTokens: snapshot.todayTokens,
+            last30DaysCostUSD: snapshot.last30DaysCostUSD,
+            last30DaysTokens: snapshot.last30DaysTokens,
+            daily: snapshot.daily.map { day in
+                LocalUsageDay(
+                    date: day.date,
+                    totalTokens: day.totalTokens,
+                    totalCost: day.totalCostUSD,
+                    modelBreakdowns: day.modelBreakdowns.map {
+                        LocalUsageModelBreakdown(
+                            modelName: $0.modelName,
+                            totalTokens: $0.totalTokens
+                        )
+                    }
+                )
+            }
+        )
     }
 
-    private static func executableURL() -> URL? {
-        let candidates = [
-            "/opt/homebrew/bin/codexbar",
-            "/usr/local/bin/codexbar",
-            "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI",
-        ]
-        return candidates
-            .map(URL.init(fileURLWithPath:))
-            .first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 }

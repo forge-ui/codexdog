@@ -1,0 +1,66 @@
+import Foundation
+
+// Kept source-compatible with the vendored scanner switch while CodexDog only calls `.codex`.
+enum UsageProvider: String, CaseIterable, Sendable, Codable {
+    case codex
+    case openai
+    case azureopenai
+    case claude
+    case clinepass
+    case cursor
+    case opencode
+    case opencodego
+    case alibaba
+    case alibabatokenplan
+    case factory
+    case gemini
+    case antigravity
+    case copilot
+    case devin
+    case zai
+    case minimax
+    case manus
+    case kimi
+    case kilo
+    case kiro
+    case vertexai
+    case augment
+    case jetbrains
+    case moonshot
+    case amp
+    case t3chat
+    case ollama
+    case synthetic
+    case warp
+    case openrouter
+    case elevenlabs
+    case windsurf
+    case zed
+    case perplexity
+    case mimo
+    case doubao
+    case sakana
+    case abacus
+    case mistral
+    case deepseek
+    case codebuff
+    case crof
+    case venice
+    case commandcode
+    case qoder
+    case stepfun
+    case bedrock
+    case grok
+    case groq
+    case llmproxy
+    case litellm
+    case deepgram
+    case poe
+    case chutes
+    case neuralwatt
+    case clawrouter
+    case longcat
+    case sub2api
+    case wayfinder
+    case zenmux
+}

@@ -11,14 +11,13 @@ The app is currently installed as `CodexRelay.app`.
 - Switch accounts automatically at 1% remaining quota.
 - Restart ChatGPT and continue recent unfinished tasks after a switch.
 - Pause scheduling or remove individual accounts.
-- Show optional local Codex token and cost estimates.
+- Show local Codex token and API-equivalent cost estimates with a built-in scanner.
 
 ## Requirements
 
 - macOS 14 or newer.
 - `/Applications/ChatGPT.app` with Codex available.
 - Two or more ChatGPT accounts that you own and manage.
-- Optional: CodexBar for the local token and cost summary only.
 
 ## Install
 
@@ -38,6 +37,10 @@ The app is installed at `~/Applications/CodexRelay.app`. It runs only in the men
 4. Enable **Automatic switching**.
 
 CodexDog reads official quota data through the Codex app-server. The displayed rows follow the quota windows OpenAI currently returns instead of assuming fixed 5-hour and 7-day limits.
+
+Local token and cost estimates are calculated directly from local Codex session logs. The embedded
+scanner is derived from CodexBar v0.44.0 under the MIT License; see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Account credentials stay on this Mac under `~/Library/Application Support/CodexRelay` with owner-only permissions. Switching preserves `~/.codex` and replaces only the active `auth.json` credential.
 
