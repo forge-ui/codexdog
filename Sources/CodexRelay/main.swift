@@ -140,6 +140,16 @@ do {
                 updatedConfig.profiles.append(name)
                 try storage.saveConfig(updatedConfig)
             }
+            let sampledAt = Date()
+            try storage.updateAccountQuota(AccountQuotaStatus(
+                profile: name,
+                updatedAt: sampledAt,
+                primary: limits.primary,
+                secondary: limits.secondary,
+                planType: limits.planType,
+                error: nil,
+                lastAttemptAt: sampledAt
+            ))
             print("Logged in \(name): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")")
         case "verify" where arguments.count == 3:
             let name = arguments[2]

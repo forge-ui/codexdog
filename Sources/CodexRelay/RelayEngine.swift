@@ -217,21 +217,20 @@ final class RelayEngine: @unchecked Sendable {
         var failures: [String] = []
 
         for profile in orderedProfiles {
+            let now = Date()
             do {
                 let isActive = profile == activeProfile
-                let codexHome: URL
+                let limits: RateLimitSnapshot
                 if isActive {
-                    codexHome = storage.paths.codexHome
+                    let server = try makeAppServer(codexHome: storage.paths.codexHome)
+                    defer { server.stop() }
+                    limits = try server.rateLimits()
                 } else {
                     guard storage.profileExists(profile) else {
                         throw RelayError.missingFile("Saved credential for \(profile)")
                     }
-                    codexHome = try storage.prepareProfileHome(profile)
+                    limits = try probeStandbyQuota(profile: profile)
                 }
-
-                let server = try makeAppServer(codexHome: codexHome)
-                defer { server.stop() }
-                let limits = try server.rateLimits()
                 guard limits.hasOfficialLimitSignal else {
                     throw RelayError.rpc("Missing official rate limit windows")
                 }
@@ -239,18 +238,15 @@ final class RelayEngine: @unchecked Sendable {
                     try storage.saveCurrentAuth(as: profile)
                     activeLimits = limits
                 }
-                try storage.updateAccountQuota(quotaStatus(profile: profile, limits: limits))
+                try storage.updateAccountQuota(
+                    quotaStatus(profile: profile, limits: limits, now: now))
             } catch {
                 if profile == activeProfile, shouldPersistActiveCredential(after: error) {
                     _ = try? storage.saveCurrentAuth(as: profile)
                 }
                 let detail = error.localizedDescription
                 failures.append("\(profile)=\(detail)")
-                try? storage.updateAccountQuota(AccountQuotaStatus(
-                    profile: profile, updatedAt: Date(), primary: nil, secondary: nil,
-                    planType: nil, error: detail,
-                    duplicateOf: storage.duplicateProfile(for: profile, among: config.profiles)
-                ))
+                _ = try? recordQuotaFailure(profile: profile, error: error, now: now)
             }
         }
 
@@ -277,17 +273,14 @@ final class RelayEngine: @unchecked Sendable {
     }
 
     private func shouldPersistActiveCredential(after error: Error) -> Bool {
-        let detail = error.localizedDescription.lowercased()
-        let authenticationFailures = [
-            "401", "403", "unauthorized", "forbidden", "token_invalidated",
-            "invalid token", "token expired", "not authenticated",
-            "authentication failed", "authentication required", "login required",
-            "refresh token"
-        ]
-        return !authenticationFailures.contains { detail.contains($0) }
+        !isAuthenticationFailure(error)
     }
 
-    func checkOnce(force: Bool = false) throws -> String {
+    func checkOnce(
+        force: Bool = false,
+        now: Date = Date(),
+        respectingSchedule: Bool = false
+    ) throws -> String {
         var state = try storage.loadState()
         let detected = storage.detectActiveProfile(in: config.profiles)
         if let reconciled = try reconcileInterruptedSwitch(state: &state, detectedProfile: detected) {
@@ -300,10 +293,27 @@ final class RelayEngine: @unchecked Sendable {
         guard !config.profiles.isEmpty else {
             return "No managed profiles"
         }
+        if respectingSchedule,
+           let active = state.activeProfile,
+           !QuotaPollingPolicy.isActiveCheckDue(
+               status: try storage.accountQuotaStatus(for: active),
+               now: now,
+               minimumInterval: TimeInterval(config.pollIntervalSeconds))
+        {
+            try refreshStandbyQuotas(
+                state: &state,
+                activeProfile: active,
+                now: now,
+                respectingSchedule: true
+            )
+            try storage.saveState(state)
+            return "Waiting for the next scheduled quota check"
+        }
         let server = try makeAppServer(codexHome: storage.paths.codexHome)
         defer { server.stop() }
         var limits: RateLimitSnapshot?
         var activeAuthenticationError: Error?
+        var activeAuthenticationFailures = 0
         do {
             let currentLimits = try server.rateLimits()
             guard currentLimits.hasOfficialLimitSignal else {
@@ -312,20 +322,27 @@ final class RelayEngine: @unchecked Sendable {
             limits = currentLimits
             if let active = state.activeProfile {
                 try storage.saveCurrentAuth(as: active)
-                try storage.updateAccountQuota(quotaStatus(profile: active, limits: currentLimits))
+                try storage.updateAccountQuota(
+                    quotaStatus(profile: active, limits: currentLimits, now: now))
             }
         } catch {
-            if let active = state.activeProfile {
+            if let active = state.activeProfile,
+               shouldPersistActiveCredential(after: error) {
                 _ = try? storage.saveCurrentAuth(as: active)
             }
             if isAuthenticationFailure(error) {
                 activeAuthenticationError = error
                 if let active = state.activeProfile {
-                    try? storage.updateAccountQuota(AccountQuotaStatus(
-                        profile: active, updatedAt: Date(), primary: nil, secondary: nil,
-                        planType: nil, error: error.localizedDescription))
+                    activeAuthenticationFailures = (
+                        try? recordQuotaFailure(
+                            profile: active, error: error, now: now)
+                    )?.consecutiveAuthenticationFailures ?? 1
                 }
             } else {
+                if let active = state.activeProfile {
+                    _ = try? recordQuotaFailure(
+                        profile: active, error: error, now: now)
+                }
                 throw error
             }
         }
@@ -333,18 +350,25 @@ final class RelayEngine: @unchecked Sendable {
         if let limits {
             summary = "primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a") plan=\(limits.planType ?? "unknown")"
         } else {
-            summary = "authentication failed: \(activeAuthenticationError?.localizedDescription ?? "unknown error")"
+            summary = "authentication failed \(activeAuthenticationFailures)/\(QuotaPollingPolicy.authenticationFailureThreshold): \(activeAuthenticationError?.localizedDescription ?? "unknown error")"
         }
-        try? refreshNextStandbyQuota(state: &state, activeProfile: state.activeProfile)
+        let exhausted = force
+            || activeAuthenticationFailures >= QuotaPollingPolicy.authenticationFailureThreshold
+            || limits?.isExhausted(threshold: config.thresholdUsedPercent) == true
+        if !exhausted {
+            try? refreshStandbyQuotas(
+                state: &state,
+                activeProfile: state.activeProfile,
+                now: now,
+                respectingSchedule: respectingSchedule
+            )
+        }
         try storage.saveRuntime(RelayRuntimeStatus(
-            updatedAt: Date(), activeProfile: state.activeProfile,
+            updatedAt: now, activeProfile: state.activeProfile,
             primaryUsedPercent: limits?.primary?.usedPercent,
             secondaryUsedPercent: limits?.secondary?.usedPercent,
             planType: limits?.planType, message: summary
         ))
-        let exhausted = force
-            || activeAuthenticationError != nil
-            || limits?.isExhausted(threshold: config.thresholdUsedPercent) == true
         if !exhausted, state.lastError != nil, state.pendingSwitch == nil {
             state.lastError = nil
             try storage.saveState(state)
@@ -368,18 +392,23 @@ final class RelayEngine: @unchecked Sendable {
                 failures.append("\(candidate)=same account as \(current)")
                 continue
             }
-            var probe: (any AppServerServing)?
+            if respectingSchedule,
+               let candidateStatus = try storage.accountQuotaStatus(for: candidate),
+               candidateStatus.error != nil,
+               !QuotaPollingPolicy.isStandbyCheckDue(
+                   status: candidateStatus,
+                   now: now)
+            {
+                failures.append("\(candidate)=waiting for authentication retry")
+                continue
+            }
             do {
-                let profileHome = try storage.prepareProfileHome(candidate)
-                let client = try makeAppServer(codexHome: profileHome)
-                probe = client
-                let candidateLimits = try client.rateLimits()
+                let candidateLimits = try probeStandbyQuota(profile: candidate)
                 guard candidateLimits.hasOfficialLimitSignal else {
                     throw RelayError.rpc("Missing official rate limit windows")
                 }
-                try storage.updateAccountQuota(quotaStatus(profile: candidate, limits: candidateLimits))
-                client.stop()
-                probe = nil
+                try storage.updateAccountQuota(
+                    quotaStatus(profile: candidate, limits: candidateLimits, now: now))
                 if candidateLimits.isExhausted(threshold: config.thresholdUsedPercent) {
                     failures.append("\(candidate)=exhausted")
                     continue
@@ -387,11 +416,8 @@ final class RelayEngine: @unchecked Sendable {
                 target = (candidate, try storage.profileAccountID(candidate))
                 break
             } catch {
-                probe?.stop()
-                try? storage.updateAccountQuota(AccountQuotaStatus(
-                    profile: candidate, updatedAt: Date(), primary: nil, secondary: nil,
-                    planType: nil, error: error.localizedDescription
-                ))
+                _ = try? recordQuotaFailure(
+                    profile: candidate, error: error, now: now)
                 failures.append("\(candidate)=\(error.localizedDescription)")
             }
         }
@@ -421,7 +447,12 @@ final class RelayEngine: @unchecked Sendable {
         let previousAuth: Data
         let sourceAccountID: String?
         if let current {
-            previousAuth = try storage.saveCurrentAuth(as: current)
+            if activeAuthenticationFailures > 0 {
+                previousAuth = try Data(
+                    contentsOf: storage.paths.profileAuth(current))
+            } else {
+                previousAuth = try storage.saveCurrentAuth(as: current)
+            }
             sourceAccountID = try storage.profileAccountID(current)
         } else {
             previousAuth = try Data(contentsOf: storage.paths.activeAuth)
@@ -433,7 +464,8 @@ final class RelayEngine: @unchecked Sendable {
         state.pendingSwitch = SwitchTransaction(
             snapshot: snapshot, phase: .prepared,
             sourceAccountID: sourceAccountID, targetAccountID: target.accountID,
-            previousLastSwitchAt: state.lastSwitchAt)
+            previousLastSwitchAt: state.lastSwitchAt,
+            preserveSourceProfileCredential: activeAuthenticationFailures > 0)
         try storage.saveState(state)
         if let previousTransactionID, previousTransactionID != switchID {
             storage.removeSwitchBackup(id: previousTransactionID)
@@ -533,9 +565,21 @@ final class RelayEngine: @unchecked Sendable {
             let finalSourceAuth: Data
             if transaction.snapshot.sourceProfile != "unmanaged",
                storage.profileExists(transaction.snapshot.sourceProfile) {
-                finalSourceAuth = try storage.saveCurrentAuth(as: transaction.snapshot.sourceProfile)
-                if let expected = transaction.sourceAccountID {
-                    try storage.assertActiveAccount(expectedAccountID: expected)
+                if transaction.preserveSourceProfileCredential {
+                    finalSourceAuth = try Data(contentsOf:
+                        storage.paths.profileAuth(transaction.snapshot.sourceProfile))
+                    if let expected = transaction.sourceAccountID,
+                       try storage.profileAccountID(transaction.snapshot.sourceProfile) != expected
+                    {
+                        throw RelayError.verification(
+                            "Saved source profile identity changed before activation")
+                    }
+                } else {
+                    finalSourceAuth = try storage.saveCurrentAuth(
+                        as: transaction.snapshot.sourceProfile)
+                    if let expected = transaction.sourceAccountID {
+                        try storage.assertActiveAccount(expectedAccountID: expected)
+                    }
                 }
             } else {
                 finalSourceAuth = try Data(contentsOf: storage.paths.activeAuth)
@@ -583,11 +627,15 @@ final class RelayEngine: @unchecked Sendable {
             }
         } catch {
             replacement?.stop()
-            _ = try? storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
+            let persistTargetCredential = shouldPersistActiveCredential(after: error)
+            if persistTargetCredential {
+                _ = try? storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
+            }
             if isAuthenticationFailure(error) || isVerificationFailure(error) {
                 return try rollbackPendingSwitch(
                     state: &state,
-                    reason: "Target validation failed: \(error.localizedDescription)")
+                    reason: "Target validation failed: \(error.localizedDescription)",
+                    persistTargetCredentialBeforeRestore: persistTargetCredential)
             }
             state.lastError = "Target validation will retry: \(error.localizedDescription)"
             try? storage.saveState(state)
@@ -837,7 +885,11 @@ final class RelayEngine: @unchecked Sendable {
         hosts.forEach { $0.stop() }
     }
 
-    private func rollbackPendingSwitch(state: inout RelayState, reason: String) throws -> String {
+    private func rollbackPendingSwitch(
+        state: inout RelayState,
+        reason: String,
+        persistTargetCredentialBeforeRestore: Bool = true
+    ) throws -> String {
         guard var transaction = state.pendingSwitch else {
             throw RelayError.verification(reason)
         }
@@ -859,7 +911,8 @@ final class RelayEngine: @unchecked Sendable {
             throw RelayError.verification(state.lastError ?? reason)
         }
 
-        if (try? storage.activeAccountID()) == transaction.targetAccountID,
+        if persistTargetCredentialBeforeRestore,
+           (try? storage.activeAccountID()) == transaction.targetAccountID,
            storage.profileExists(transaction.snapshot.targetProfile) {
             _ = try? storage.saveCurrentAuth(as: transaction.snapshot.targetProfile)
         }
@@ -899,10 +952,13 @@ final class RelayEngine: @unchecked Sendable {
 
     private func isAuthenticationFailure(_ error: Error) -> Bool {
         let message = error.localizedDescription.lowercased()
-        return message.contains("token_invalidated")
-            || message.contains("401")
-            || message.contains("unauthorized")
-            || message.contains("authentication token")
+        let authenticationFailures = [
+            "401", "403", "unauthorized", "forbidden", "token_invalidated",
+            "invalid token", "token expired", "not authenticated",
+            "authentication failed", "authentication required", "login required",
+            "authentication token", "refresh token",
+        ]
+        return authenticationFailures.contains { message.contains($0) }
     }
 
     private func isVerificationFailure(_ error: Error) -> Bool {
@@ -916,7 +972,7 @@ final class RelayEngine: @unchecked Sendable {
         while true {
             let timestamp = ISO8601DateFormatter().string(from: Date())
             do {
-                let result = try checkOnce()
+                let result = try checkOnce(respectingSchedule: true)
                 writeLog("[\(timestamp)] \(result)")
             } catch {
                 writeLog("[\(timestamp)] ERROR \(error.localizedDescription)")
@@ -939,13 +995,79 @@ final class RelayEngine: @unchecked Sendable {
         try? FileHandle.standardOutput.write(contentsOf: data)
     }
 
-    private func quotaStatus(profile: String, limits: RateLimitSnapshot) -> AccountQuotaStatus {
-        AccountQuotaStatus(profile: profile, updatedAt: Date(), primary: limits.primary,
-                           secondary: limits.secondary, planType: limits.planType, error: nil,
-                           duplicateOf: storage.duplicateProfile(for: profile, among: config.profiles))
+    private func quotaStatus(
+        profile: String,
+        limits: RateLimitSnapshot,
+        now: Date = Date()
+    ) -> AccountQuotaStatus {
+        AccountQuotaStatus(
+            profile: profile,
+            updatedAt: now,
+            primary: limits.primary,
+            secondary: limits.secondary,
+            planType: limits.planType,
+            error: nil,
+            duplicateOf: storage.duplicateProfile(
+                for: profile, among: config.profiles),
+            lastAttemptAt: now,
+            consecutiveAuthenticationFailures: 0
+        )
     }
 
-    private func refreshNextStandbyQuota(state: inout RelayState, activeProfile: String?) throws {
+    @discardableResult
+    private func recordQuotaFailure(
+        profile: String,
+        error: Error,
+        now: Date
+    ) throws -> AccountQuotaStatus {
+        let previous = try storage.accountQuotaStatus(for: profile)
+        let authenticationFailure = isAuthenticationFailure(error)
+        let failureCount = authenticationFailure
+            ? (previous?.consecutiveAuthenticationFailures ?? 0) + 1
+            : 0
+        let status = AccountQuotaStatus(
+            profile: profile,
+            updatedAt: previous?.updatedAt ?? now,
+            primary: previous?.primary,
+            secondary: previous?.secondary,
+            planType: previous?.planType,
+            error: error.localizedDescription,
+            duplicateOf: storage.duplicateProfile(
+                for: profile, among: config.profiles),
+            lastAttemptAt: now,
+            consecutiveAuthenticationFailures: failureCount
+        )
+        try storage.updateAccountQuota(status)
+        return status
+    }
+
+    private func probeStandbyQuota(profile: String) throws -> RateLimitSnapshot {
+        let probeHome = try storage.prepareProfileProbeHome(profile)
+        defer { storage.removeProfileProbeHome(probeHome) }
+        var probe: (any AppServerServing)?
+        do {
+            let client = try makeAppServer(codexHome: probeHome)
+            probe = client
+            let limits = try client.rateLimits()
+            client.stop()
+            probe = nil
+            try storage.commitProfileProbeAuth(profile, from: probeHome)
+            return limits
+        } catch {
+            probe?.stop()
+            if shouldPersistActiveCredential(after: error) {
+                try? storage.commitProfileProbeAuth(profile, from: probeHome)
+            }
+            throw error
+        }
+    }
+
+    private func refreshStandbyQuotas(
+        state: inout RelayState,
+        activeProfile: String?,
+        now: Date,
+        respectingSchedule: Bool
+    ) throws {
         let scheduledProfiles = config.scheduledProfiles
         guard !scheduledProfiles.isEmpty else { return }
         let start = (state.nextQuotaProfileIndex ?? 0) % scheduledProfiles.count
@@ -953,25 +1075,23 @@ final class RelayEngine: @unchecked Sendable {
             let index = (start + offset) % scheduledProfiles.count
             let profile = scheduledProfiles[index]
             guard profile != activeProfile, storage.profileExists(profile) else { continue }
-            var probe: (any AppServerServing)?
+            if respectingSchedule,
+               !QuotaPollingPolicy.isStandbyCheckDue(
+                   status: try storage.accountQuotaStatus(for: profile),
+                   now: now)
+            {
+                continue
+            }
             do {
-                let home = try storage.prepareProfileHome(profile)
-                let client = try makeAppServer(codexHome: home)
-                probe = client
-                let limits = try client.rateLimits()
-                client.stop()
-                probe = nil
-                try storage.updateAccountQuota(quotaStatus(profile: profile, limits: limits))
+                let limits = try probeStandbyQuota(profile: profile)
+                try storage.updateAccountQuota(
+                    quotaStatus(profile: profile, limits: limits, now: now))
             } catch {
-                probe?.stop()
-                try storage.updateAccountQuota(AccountQuotaStatus(
-                    profile: profile, updatedAt: Date(), primary: nil, secondary: nil,
-                    planType: nil, error: error.localizedDescription
-                ))
+                _ = try recordQuotaFailure(profile: profile, error: error, now: now)
             }
             state.nextQuotaProfileIndex = (index + 1) % scheduledProfiles.count
             try storage.saveState(state)
-            return
+            if !respectingSchedule { return }
         }
     }
 

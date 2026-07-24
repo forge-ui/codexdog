@@ -191,6 +191,35 @@ import Testing
     #expect(quotas.accounts["profile"] == nil)
 }
 
+@Test func bootstrapRemovesOnlyStaleProbeHomes() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codex = root.appendingPathComponent("codex")
+    try FileManager.default.createDirectory(at: codex, withIntermediateDirectories: true)
+    let storage = RelayStorage(paths: RelayPaths(
+        config: RelayConfig(codexHome: codex.path),
+        rootOverride: root.appendingPathComponent("relay")))
+    try storage.bootstrap()
+
+    let stale = storage.paths.probes.appendingPathComponent("stale", isDirectory: true)
+    let fresh = storage.paths.probes.appendingPathComponent("fresh", isDirectory: true)
+    try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: fresh, withIntermediateDirectories: true)
+    try Data("stale credential copy".utf8)
+        .write(to: stale.appendingPathComponent("auth.json"))
+    try Data("fresh credential copy".utf8)
+        .write(to: fresh.appendingPathComponent("auth.json"))
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(-2 * 60 * 60)],
+        ofItemAtPath: stale.path
+    )
+
+    try storage.bootstrap()
+
+    #expect(!FileManager.default.fileExists(atPath: stale.path))
+    #expect(FileManager.default.fileExists(atPath: fresh.path))
+}
+
 private func authData(accountID: String, token: String) -> Data {
     Data(#"{"tokens":{"account_id":"\#(accountID)","access_token":"\#(token)"}}"#.utf8)
 }

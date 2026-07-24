@@ -17,6 +17,7 @@ struct RelayPaths: Sendable {
     var runtime: URL { root.appendingPathComponent("runtime.json") }
     var accountQuotas: URL { root.appendingPathComponent("account-quotas.json") }
     var logs: URL { root.appendingPathComponent("relay.log") }
+    var probes: URL { root.appendingPathComponent("probes", isDirectory: true) }
     func profileAuth(_ name: String) -> URL { profiles.appendingPathComponent(name).appendingPathComponent("auth.json") }
     var activeAuth: URL { codexHome.appendingPathComponent("auth.json") }
 }
@@ -43,6 +44,7 @@ final class RelayStorage: @unchecked Sendable {
     func bootstrap() throws {
         try fm.createDirectory(at: paths.profiles, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try fm.createDirectory(at: paths.codexHome, withIntermediateDirectories: true)
+        removeStaleProfileProbeHomes()
         if !fm.fileExists(atPath: paths.config.path) { try write(RelayConfig.default, to: paths.config, permissions: 0o600) }
         if !fm.fileExists(atPath: paths.state.path) { try write(RelayState(), to: paths.state, permissions: 0o600) }
     }
@@ -62,6 +64,11 @@ final class RelayStorage: @unchecked Sendable {
         }
         collection.accounts[status.profile] = status
         try write(collection, to: paths.accountQuotas, permissions: 0o600)
+    }
+
+    func accountQuotaStatus(for profile: String) throws -> AccountQuotaStatus? {
+        guard fm.fileExists(atPath: paths.accountQuotas.path) else { return nil }
+        return try read(AccountQuotaCollection.self, from: paths.accountQuotas).accounts[profile]
     }
 
     func deleteProfile(_ profile: String) throws {
@@ -103,6 +110,76 @@ final class RelayStorage: @unchecked Sendable {
         let directory = paths.profiles.appendingPathComponent(profile, isDirectory: true)
         try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return directory
+    }
+
+    func prepareProfileProbeHome(_ profile: String) throws -> URL {
+        try validate(profile)
+        let source = try authSnapshot(
+            at: paths.profileAuth(profile), label: "Profile \(profile) auth")
+        try fm.createDirectory(
+            at: paths.probes,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let directory = paths.probes.appendingPathComponent(
+            UUID().uuidString, isDirectory: true)
+        do {
+            try fm.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try atomicWrite(
+                source.data,
+                to: directory.appendingPathComponent("auth.json"),
+                permissions: 0o600
+            )
+            return directory
+        } catch {
+            try? fm.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    func commitProfileProbeAuth(_ profile: String, from probeHome: URL) throws {
+        try validate(profile)
+        let existing = try authSnapshot(
+            at: paths.profileAuth(profile), label: "Profile \(profile) auth")
+        let refreshed = try authSnapshot(
+            at: probeHome.appendingPathComponent("auth.json"),
+            label: "Profile \(profile) probe auth"
+        )
+        guard existing.accountID == refreshed.accountID else {
+            throw RelayError.verification(
+                "Profile \(profile) identity changed during its quota probe")
+        }
+        try atomicWrite(
+            refreshed.data,
+            to: paths.profileAuth(profile),
+            permissions: 0o600
+        )
+    }
+
+    func removeProfileProbeHome(_ probeHome: URL) {
+        guard probeHome.deletingLastPathComponent() == paths.probes else { return }
+        try? fm.removeItem(at: probeHome)
+    }
+
+    private func removeStaleProfileProbeHomes(
+        now: Date = Date(),
+        maximumAge: TimeInterval = 60 * 60
+    ) {
+        guard let probeHomes = try? fm.contentsOfDirectory(
+            at: paths.probes,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        for probeHome in probeHomes {
+            guard let attributes = try? fm.attributesOfItem(atPath: probeHome.path),
+                  let modifiedAt = attributes[.modificationDate] as? Date,
+                  now.timeIntervalSince(modifiedAt) >= maximumAge
+            else { continue }
+            try? fm.removeItem(at: probeHome)
+        }
     }
 
     func secureProfileAuth(_ profile: String) throws {

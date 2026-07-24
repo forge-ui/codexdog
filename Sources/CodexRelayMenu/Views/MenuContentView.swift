@@ -349,16 +349,11 @@ private struct AccountQuotaGroup: View {
     }
 
     private var accountStatus: String {
-        if !isScheduled { return "调度已关闭" }
-        if let duplicateDisplayName { return "与 \(duplicateDisplayName) 是同一账号" }
-        if let error = quota?.error {
-            if error.contains("token_invalidated") || error.contains("401 Unauthorized") {
-                return "登录已失效，请删除后重新添加"
-            }
-            return "同步失败"
-        }
-        guard let updatedAt = quota?.updatedAt else { return "等待官方额度" }
-        return "更新于 \(updatedAt.formatted(date: .omitted, time: .shortened))"
+        AccountStatusPresentation.text(
+            isScheduled: isScheduled,
+            duplicateDisplayName: duplicateDisplayName,
+            quota: quota
+        )
     }
 
     private var statusColor: Color {

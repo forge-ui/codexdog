@@ -137,12 +137,16 @@ private struct EngineHarness {
     let app: FakeChatGPTController
 }
 
-private func makeEngineHarness() throws -> EngineHarness {
+private func makeEngineHarness(
+    profiles: [String] = ["a", "b"],
+    activeProfile: String = "a",
+    activeUsedPercent: Int = 99
+) throws -> EngineHarness {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let codexHome = root.appendingPathComponent("codex", isDirectory: true)
     try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
     let config = RelayConfig(
-        profiles: ["a", "b"], thresholdUsedPercent: 99,
+        profiles: profiles, thresholdUsedPercent: 99,
         switchCooldownSeconds: 0, recoveryRecentHours: 24,
         maxThreadsToWake: 20, maxConcurrentRecoveryTurns: 3,
         dryRun: false, codexHome: codexHome.path)
@@ -151,25 +155,33 @@ private func makeEngineHarness() throws -> EngineHarness {
     try storage.bootstrap()
     try storage.saveConfig(config)
 
-    try engineTestAuth(accountID: "account-a", token: "a-token")
-        .write(to: storage.paths.activeAuth)
-    try storage.saveCurrentAuth(as: "a")
-    try engineTestAuth(accountID: "account-b", token: "b-token")
-        .write(to: storage.paths.activeAuth)
-    try storage.saveCurrentAuth(as: "b")
-    _ = try storage.activate(profile: "a")
+    for profile in profiles {
+        try engineTestAuth(accountID: "account-\(profile)", token: "\(profile)-token")
+            .write(to: storage.paths.activeAuth)
+        try storage.saveCurrentAuth(as: profile)
+    }
+    _ = try storage.activate(profile: activeProfile)
     var state = try storage.loadState()
-    state.activeProfile = "a"
+    state.activeProfile = activeProfile
     try storage.saveState(state)
 
-    let backend = FakeRelayBackend(storage: storage, limitsByAccount: [
-        "account-a": RateLimitSnapshot(
-            primary: .init(usedPercent: 99, resetsAt: nil), secondary: nil,
-            reachedReason: nil, planType: "pro"),
-        "account-b": RateLimitSnapshot(
-            primary: .init(usedPercent: 10, resetsAt: nil), secondary: nil,
-            reachedReason: nil, planType: "pro"),
-    ])
+    let backend = FakeRelayBackend(
+        storage: storage,
+        limitsByAccount: Dictionary(uniqueKeysWithValues: profiles.map { profile in
+            (
+                "account-\(profile)",
+                RateLimitSnapshot(
+                    primary: .init(
+                        usedPercent: profile == activeProfile ? activeUsedPercent : 10,
+                        resetsAt: nil
+                    ),
+                    secondary: nil,
+                    reachedReason: nil,
+                    planType: "pro"
+                )
+            )
+        })
+    )
     let app = FakeChatGPTController()
     let engine = RelayEngine(
         storage: storage, config: config, appController: app,
@@ -359,6 +371,25 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     )
 }
 
+@Test func transientStandbyQuotaFailureStillCommitsARotatedCredential() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.rotatedTokenByAccountCall["account-b"] = [1: "b-rotated-valid"]
+    harness.backend.failuresByAccountCall["account-b"] = [
+        1: .rpc("503 Service Unavailable")
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.refreshAllQuotas()
+    }
+
+    #expect(
+        engineTestToken(
+            try Data(contentsOf: harness.storage.paths.profileAuth("b"))
+        ) == "b-rotated-valid"
+    )
+}
+
 @Test func successfulQuotaRefreshPreservesAnUnrelatedWatchdogError() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
@@ -390,24 +421,220 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     #expect(try harness.storage.loadState().pendingSwitch == nil)
 }
 
-@Test func invalidCurrentTokenFailsOverToHealthyStandby() throws {
+@Test func currentAuthenticationMustFailThreeTimesBeforeFailover() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
     harness.backend.failuresByAccountCall["account-a"] = [
-        1: .rpc("401 Unauthorized: token_invalidated")
+        1: .rpc("401 Unauthorized: token_invalidated"),
+        2: .rpc("401 Unauthorized: token_invalidated"),
+        3: .rpc("401 Unauthorized: token_invalidated"),
     ]
+    let savedCredential = try Data(contentsOf: harness.storage.paths.profileAuth("a"))
+    harness.backend.rotatedTokenByAccountCall["account-a"] = [1: "rotated-invalid-token"]
 
     _ = try harness.engine.checkOnce()
+    var quotas = try loadAccountQuotas(harness.storage)
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(quotas.accounts["a"]?.consecutiveAuthenticationFailures == 1)
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("a")) == savedCredential)
+
+    _ = try harness.engine.checkOnce()
+    quotas = try loadAccountQuotas(harness.storage)
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(quotas.accounts["a"]?.consecutiveAuthenticationFailures == 2)
+
+    _ = try harness.engine.checkOnce()
+    quotas = try loadAccountQuotas(harness.storage)
 
     #expect(try harness.storage.activeAccountID() == "account-b")
     #expect(try harness.storage.loadState().activeProfile == "b")
+    #expect(quotas.accounts["a"]?.consecutiveAuthenticationFailures == 3)
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("a")) == savedCredential)
+}
+
+@Test func successfulAuthenticationCheckClearsTheFailureCounter() throws {
+    let harness = try makeEngineHarness(activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.failuresByAccountCall["account-a"] = [
+        1: .rpc("401 Unauthorized: token_invalidated"),
+    ]
+
+    _ = try harness.engine.checkOnce()
+    #expect(
+        try loadAccountQuotas(harness.storage)
+            .accounts["a"]?.consecutiveAuthenticationFailures == 1
+    )
+
+    _ = try harness.engine.checkOnce()
+    let quota = try loadAccountQuotas(harness.storage).accounts["a"]
+    #expect(quota?.consecutiveAuthenticationFailures == 0)
+    #expect(quota?.error == nil)
+    #expect(try harness.storage.activeAccountID() == "account-a")
+}
+
+@Test func forbiddenAuthenticationFailureUsesTheRetryBudget() throws {
+    let harness = try makeEngineHarness(activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.failuresByAccountCall["account-a"] = [
+        1: .rpc("403 Forbidden: authentication required"),
+    ]
+
+    let result = try harness.engine.checkOnce()
+    let quota = try loadAccountQuotas(harness.storage).accounts["a"]
+
+    #expect(result.contains("authentication failed 1/3"))
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(quota?.consecutiveAuthenticationFailures == 1)
+}
+
+@Test func thirdStandbySingle401IsRetriedWithoutCorruptingItsSavedCredential() throws {
+    let harness = try makeEngineHarness(
+        profiles: ["a", "b", "c"],
+        activeUsedPercent: 10
+    )
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    let savedCredential = try Data(contentsOf: harness.storage.paths.profileAuth("c"))
+    harness.backend.rotatedTokenByAccountCall["account-c"] = [1: "rotated-invalid-token"]
+    harness.backend.failuresByAccountCall["account-c"] = [
+        1: .rpc("401 Unauthorized: token_invalidated"),
+    ]
+
+    _ = try harness.engine.checkOnce(now: now, respectingSchedule: true)
+    let quota = try loadAccountQuotas(harness.storage).accounts["c"]
+
+    #expect(quota?.consecutiveAuthenticationFailures == 1)
+    #expect(quota?.error?.contains("401 Unauthorized") == true)
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("c")) == savedCredential)
+    #expect(try harness.storage.activeAccountID() == "account-a")
+}
+
+@Test func exhaustedAccountDoesNotProbeAStandbyTwiceInOneCheck() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.failuresByAccountCall["account-b"] = [
+        1: .rpc("401 Unauthorized: token_invalidated"),
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.checkOnce()
+    }
+    let quota = try loadAccountQuotas(harness.storage).accounts["b"]
+
+    #expect(harness.backend.rateLimitCalls["account-b"] == 1)
+    #expect(quota?.consecutiveAuthenticationFailures == 1)
+    #expect(try harness.storage.activeAccountID() == "account-a")
+}
+
+@Test func failedCandidateAuthenticationRespectsProgressiveRetryDelays() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let startedAt = Date(timeIntervalSince1970: 2_000_000_000)
+    harness.backend.failuresByAccountCall["account-b"] = [
+        1: .rpc("401 Unauthorized: token_invalidated"),
+        2: .rpc("401 Unauthorized: token_invalidated"),
+        3: .rpc("401 Unauthorized: token_invalidated"),
+    ]
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.checkOnce(now: startedAt, respectingSchedule: true)
+    }
+    #expect(throws: RelayError.self) {
+        try harness.engine.checkOnce(
+            now: startedAt.addingTimeInterval(30),
+            respectingSchedule: true
+        )
+    }
+    #expect(throws: RelayError.self) {
+        try harness.engine.checkOnce(
+            now: startedAt.addingTimeInterval(60),
+            respectingSchedule: true
+        )
+    }
+    #expect(harness.backend.rateLimitCalls["account-b"] == 2)
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.checkOnce(
+            now: startedAt.addingTimeInterval(150),
+            respectingSchedule: true
+        )
+    }
+    #expect(harness.backend.rateLimitCalls["account-b"] == 3)
+}
+
+@Test func scheduledActiveChecksUseAdaptiveIntervals() throws {
+    let sampledAt = Date(timeIntervalSince1970: 2_000_000_000)
+    for (usedPercent, interval) in [(89, 300.0), (90, 60.0), (98, 30.0)] {
+        let harness = try makeEngineHarness(activeUsedPercent: usedPercent)
+        defer { try? FileManager.default.removeItem(at: harness.root) }
+        for profile in ["a", "b"] {
+            try harness.storage.updateAccountQuota(AccountQuotaStatus(
+                profile: profile,
+                updatedAt: sampledAt,
+                primary: .init(
+                    usedPercent: profile == "a" ? usedPercent : 10,
+                    resetsAt: nil
+                ),
+                secondary: nil,
+                planType: "pro",
+                error: nil,
+                lastAttemptAt: sampledAt
+            ))
+        }
+
+        _ = try harness.engine.checkOnce(
+            now: sampledAt.addingTimeInterval(interval - 1),
+            respectingSchedule: true
+        )
+        #expect(harness.backend.rateLimitCalls["account-a"] == nil)
+
+        _ = try harness.engine.checkOnce(
+            now: sampledAt.addingTimeInterval(interval),
+            respectingSchedule: true
+        )
+        #expect(harness.backend.rateLimitCalls["account-a"] == 1)
+    }
+}
+
+@Test func standbyAccountsAreNotProbedAgainBeforeTwentyMinutes() throws {
+    let harness = try makeEngineHarness(
+        profiles: ["a", "b", "c"],
+        activeUsedPercent: 10
+    )
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let sampledAt = Date(timeIntervalSince1970: 2_000_000_000)
+    for profile in ["a", "b", "c"] {
+        try harness.storage.updateAccountQuota(AccountQuotaStatus(
+            profile: profile,
+            updatedAt: sampledAt,
+            primary: .init(usedPercent: 10, resetsAt: nil),
+            secondary: nil,
+            planType: "pro",
+            error: nil,
+            lastAttemptAt: sampledAt
+        ))
+    }
+
+    _ = try harness.engine.checkOnce(
+        now: sampledAt.addingTimeInterval(10 * 60),
+        respectingSchedule: true
+    )
+    #expect(harness.backend.rateLimitCalls["account-b"] == nil)
+    #expect(harness.backend.rateLimitCalls["account-c"] == nil)
+
+    _ = try harness.engine.checkOnce(
+        now: sampledAt.addingTimeInterval(20 * 60),
+        respectingSchedule: true
+    )
+    #expect(harness.backend.rateLimitCalls["account-b"] == 1)
+    #expect(harness.backend.rateLimitCalls["account-c"] == 1)
 }
 
 @Test func rotatedTargetTokenSurvivesTransientValidationFailureAndRetry() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
-    harness.backend.rotatedTokenByAccountCall["account-b"] = [3: "b-rotated"]
-    harness.backend.failuresByAccountCall["account-b"] = [3: .rpc("503 Service Unavailable")]
+    harness.backend.rotatedTokenByAccountCall["account-b"] = [2: "b-rotated"]
+    harness.backend.failuresByAccountCall["account-b"] = [2: .rpc("503 Service Unavailable")]
 
     #expect(throws: RelayError.self) {
         try harness.engine.checkOnce()
@@ -426,8 +653,10 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
 @Test func terminalTargetValidationFailureRollsBackAndReopensSource() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
+    let savedTargetAuth = try Data(contentsOf: harness.storage.paths.profileAuth("b"))
+    harness.backend.rotatedTokenByAccountCall["account-b"] = [2: "b-invalid-rotated"]
     harness.backend.failuresByAccountCall["account-b"] = [
-        3: .rpc("401 Unauthorized: token_invalidated")
+        2: .rpc("401 Unauthorized: token_invalidated")
     ]
 
     let result = try harness.engine.checkOnce()
@@ -439,6 +668,32 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     #expect(state.pendingSwitch == nil)
     #expect(state.lastError?.contains("Target validation failed") == true)
     #expect(harness.app.isRunning)
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("b")) == savedTargetAuth)
+}
+
+@Test func thirdTargetAuthenticationFailurePreservesSavedCredential() throws {
+    let harness = try makeEngineHarness(profiles: ["a", "b", "c"])
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.limitsByAccount["account-b"] = RateLimitSnapshot(
+        primary: .init(usedPercent: 99, resetsAt: nil),
+        secondary: nil,
+        reachedReason: nil,
+        planType: "pro"
+    )
+    let savedTargetAuth = try Data(contentsOf: harness.storage.paths.profileAuth("c"))
+    harness.backend.rotatedTokenByAccountCall["account-c"] = [2: "c-invalid-rotated"]
+    harness.backend.failuresByAccountCall["account-c"] = [
+        2: .rpc("401 Unauthorized: token_invalidated")
+    ]
+
+    let result = try harness.engine.checkOnce()
+    let state = try harness.storage.loadState()
+
+    #expect(result.contains("Rolled back"))
+    #expect(try harness.storage.activeAccountID() == "account-a")
+    #expect(state.activeProfile == "a")
+    #expect(state.pendingSwitch == nil)
+    #expect(try Data(contentsOf: harness.storage.paths.profileAuth("c")) == savedTargetAuth)
 }
 
 @Test func acceptedRecoveryIsReconciledAfterLostResponseWithoutDuplicateTurn() throws {

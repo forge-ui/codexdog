@@ -37,6 +37,8 @@ struct MenuAccountQuota: Decodable {
     var planType: String?
     var error: String?
     var duplicateOf: String?
+    var lastAttemptAt: Date? = nil
+    var consecutiveAuthenticationFailures: Int? = nil
 }
 
 struct MenuAccountQuotaCollection: Decodable {

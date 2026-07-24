@@ -2,6 +2,48 @@ import Foundation
 import Testing
 @testable import CodexRelayMenu
 
+@Test func aSingleAuthenticationFailureShowsRetryInsteadOfDelete() {
+    let quota = MenuAccountQuota(
+        profile: "account-a",
+        updatedAt: Date(),
+        primary: nil,
+        secondary: nil,
+        planType: "pro",
+        error: "401 Unauthorized: token_invalidated",
+        duplicateOf: nil,
+        consecutiveAuthenticationFailures: 1
+    )
+
+    #expect(
+        AccountStatusPresentation.text(
+            isScheduled: true,
+            duplicateDisplayName: nil,
+            quota: quota
+        ) == "认证检查失败，正在重试（1/3）"
+    )
+}
+
+@Test func threeAuthenticationFailuresRequestReloginWithoutRequestingDeletion() {
+    let quota = MenuAccountQuota(
+        profile: "account-a",
+        updatedAt: Date(),
+        primary: nil,
+        secondary: nil,
+        planType: "pro",
+        error: "401 Unauthorized: token_invalidated",
+        duplicateOf: nil,
+        consecutiveAuthenticationFailures: 3
+    )
+
+    let text = AccountStatusPresentation.text(
+        isScheduled: true,
+        duplicateDisplayName: nil,
+        quota: quota
+    )
+    #expect(text == "连续认证失败，请重新登录")
+    #expect(!text.contains("删除"))
+}
+
 @Test func weeklyOnlyOfficialWindowIsPresentedAsSevenDays() {
     let quota = MenuAccountQuota(
         profile: "account-a",

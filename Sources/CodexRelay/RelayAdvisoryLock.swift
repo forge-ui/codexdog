@@ -105,7 +105,7 @@ extension RelayEngine {
             do {
                 let result = try advisoryLock.withLock {
                     do {
-                        return try checkOnce()
+                        return try checkOnce(respectingSchedule: true)
                     } catch {
                         if var state = try? storage.loadState() {
                             state.lastError = error.localizedDescription

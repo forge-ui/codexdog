@@ -167,11 +167,13 @@ struct SwitchTransaction: Codable, Equatable, Sendable {
     let sourceAccountID: String?
     let targetAccountID: String
     let previousLastSwitchAt: Date?
+    let preserveSourceProfileCredential: Bool
     var recoveryAttempts: [String: Int] = [:]
     var recoveryProtocolVersion: Int?
 
     init(snapshot: SwitchSnapshot, phase: SwitchPhase, sourceAccountID: String?,
          targetAccountID: String, previousLastSwitchAt: Date?,
+         preserveSourceProfileCredential: Bool = false,
          recoveryAttempts: [String: Int] = [:],
          recoveryProtocolVersion: Int? = SwitchTransaction.currentRecoveryProtocolVersion) {
         self.snapshot = snapshot
@@ -179,13 +181,14 @@ struct SwitchTransaction: Codable, Equatable, Sendable {
         self.sourceAccountID = sourceAccountID
         self.targetAccountID = targetAccountID
         self.previousLastSwitchAt = previousLastSwitchAt
+        self.preserveSourceProfileCredential = preserveSourceProfileCredential
         self.recoveryAttempts = recoveryAttempts
         self.recoveryProtocolVersion = recoveryProtocolVersion
     }
 
     private enum CodingKeys: String, CodingKey {
         case snapshot, phase, sourceAccountID, targetAccountID, previousLastSwitchAt
-        case recoveryAttempts, recoveryProtocolVersion
+        case preserveSourceProfileCredential, recoveryAttempts, recoveryProtocolVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -195,6 +198,8 @@ struct SwitchTransaction: Codable, Equatable, Sendable {
         sourceAccountID = try values.decodeIfPresent(String.self, forKey: .sourceAccountID)
         targetAccountID = try values.decode(String.self, forKey: .targetAccountID)
         previousLastSwitchAt = try values.decodeIfPresent(Date.self, forKey: .previousLastSwitchAt)
+        preserveSourceProfileCredential = try values.decodeIfPresent(
+            Bool.self, forKey: .preserveSourceProfileCredential) ?? false
         recoveryAttempts = try values.decodeIfPresent([String: Int].self, forKey: .recoveryAttempts) ?? [:]
         recoveryProtocolVersion = try values.decodeIfPresent(Int.self, forKey: .recoveryProtocolVersion)
     }
@@ -259,9 +264,12 @@ struct AccountQuotaStatus: Codable, Equatable, Sendable {
     var planType: String?
     var error: String?
     var duplicateOf: String?
+    var lastAttemptAt: Date
+    var consecutiveAuthenticationFailures: Int
 
     init(profile: String, updatedAt: Date, primary: RateLimitWindow?, secondary: RateLimitWindow?,
-         planType: String?, error: String?, duplicateOf: String? = nil) {
+         planType: String?, error: String?, duplicateOf: String? = nil,
+         lastAttemptAt: Date? = nil, consecutiveAuthenticationFailures: Int = 0) {
         self.profile = profile
         self.updatedAt = updatedAt
         self.primary = primary
@@ -269,6 +277,31 @@ struct AccountQuotaStatus: Codable, Equatable, Sendable {
         self.planType = planType
         self.error = error
         self.duplicateOf = duplicateOf
+        self.lastAttemptAt = lastAttemptAt ?? updatedAt
+        self.consecutiveAuthenticationFailures = consecutiveAuthenticationFailures
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case profile, updatedAt, primary, secondary, planType, error, duplicateOf
+        case lastAttemptAt, consecutiveAuthenticationFailures
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let updatedAt = try values.decode(Date.self, forKey: .updatedAt)
+        self.init(
+            profile: try values.decode(String.self, forKey: .profile),
+            updatedAt: updatedAt,
+            primary: try values.decodeIfPresent(RateLimitWindow.self, forKey: .primary),
+            secondary: try values.decodeIfPresent(RateLimitWindow.self, forKey: .secondary),
+            planType: try values.decodeIfPresent(String.self, forKey: .planType),
+            error: try values.decodeIfPresent(String.self, forKey: .error),
+            duplicateOf: try values.decodeIfPresent(String.self, forKey: .duplicateOf),
+            lastAttemptAt: try values.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
+                ?? updatedAt,
+            consecutiveAuthenticationFailures: try values.decodeIfPresent(
+                Int.self, forKey: .consecutiveAuthenticationFailures) ?? 0
+        )
     }
 }
 
