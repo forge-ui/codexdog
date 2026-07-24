@@ -87,6 +87,244 @@ import Testing
     expectSameUsage(warm, cold)
 }
 
+@Test func recoverySubagentCumulativePrefixBeforeModelContextIsNotCountedTwice() throws {
+    let fixture = try UsageFixture()
+    defer { fixture.remove() }
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+    let parentTimestamp = "2026-07-18T09:59:00Z"
+    let childTimestamp = "2026-07-18T10:00:00Z"
+
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T09-59-00-recovery-parent.jsonl",
+        lines: [
+            sessionMeta(id: "recovery-parent", timestamp: parentTimestamp),
+            turnContext(model: "gpt-5.6-sol", timestamp: parentTimestamp),
+            tokenCount(
+                timestamp: parentTimestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 1_000, cached: 900, output: 100)
+            ),
+        ]
+    )
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T10-00-00-recovery-child.jsonl",
+        lines: [
+            sessionMeta(
+                id: "recovery-child",
+                timestamp: childTimestamp,
+                source: ["subagent": ["thread_spawn": [:]]],
+                forkedFromID: "recovery-parent"
+            ),
+            // Recovery rollouts can replay the parent's cumulative counter before the first
+            // model-bearing turn context. The small `last` value proves this is not a fresh
+            // independent counter whose first total should be charged to the child.
+            tokenCount(
+                timestamp: childTimestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 10, cached: 9, output: 1)
+            ),
+            turnContext(model: "gpt-5.6-sol", timestamp: "2026-07-18T10:01:00Z"),
+            tokenCount(
+                timestamp: "2026-07-18T10:02:00Z",
+                total: (input: 1_100, cached: 950, output: 110),
+                last: (input: 100, cached: 50, output: 10)
+            ),
+        ]
+    )
+
+    let cold = try fixture.scan(now: now, forceRescan: true)
+    #expect(cold.last30DaysTokens == 1_210)
+    #expect(cold.daily[0].modelBreakdowns == [
+        CodexUsageModelBreakdown(modelName: "gpt-5.6-sol", totalTokens: 1_210),
+    ])
+    let warm = try fixture.scan(now: now.addingTimeInterval(61), forceRescan: false)
+    expectSameUsage(warm, cold)
+}
+
+@Test func forkedSubagentWithResetCounterRemainsIndependent() throws {
+    let fixture = try UsageFixture()
+    defer { fixture.remove() }
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+    let parentTimestamp = "2026-07-18T09:59:00Z"
+    let childTimestamp = "2026-07-18T10:00:00Z"
+
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T09-59-00-independent-parent.jsonl",
+        lines: [
+            sessionMeta(id: "independent-parent", timestamp: parentTimestamp),
+            turnContext(model: "gpt-5.6-sol", timestamp: parentTimestamp),
+            tokenCount(
+                timestamp: parentTimestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 1_000, cached: 900, output: 100)
+            ),
+        ]
+    )
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T10-00-00-independent-child.jsonl",
+        lines: [
+            sessionMeta(
+                id: "independent-child",
+                timestamp: childTimestamp,
+                source: ["subagent": ["thread_spawn": [:]]],
+                forkedFromID: "independent-parent"
+            ),
+            turnContext(model: "gpt-5.6-sol", timestamp: childTimestamp),
+            tokenCount(
+                timestamp: "2026-07-18T10:01:00Z",
+                total: (input: 40, cached: 30, output: 10),
+                last: (input: 40, cached: 30, output: 10)
+            ),
+        ]
+    )
+
+    let cold = try fixture.scan(now: now, forceRescan: true)
+    #expect(cold.last30DaysTokens == 1_150)
+    #expect(cold.daily[0].modelBreakdowns == [
+        CodexUsageModelBreakdown(modelName: "gpt-5.6-sol", totalTokens: 1_150),
+    ])
+    let warm = try fixture.scan(now: now.addingTimeInterval(61), forceRescan: false)
+    expectSameUsage(warm, cold)
+}
+
+@Test func forkedSubagentWithPreContextResetCounterRemainsIndependent() throws {
+    let fixture = try UsageFixture()
+    defer { fixture.remove() }
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+    let parentTimestamp = "2026-07-18T09:59:00Z"
+    let childTimestamp = "2026-07-18T10:00:00Z"
+
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T09-59-00-pre-context-parent.jsonl",
+        lines: [
+            sessionMeta(id: "pre-context-parent", timestamp: parentTimestamp),
+            turnContext(model: "gpt-5.6-sol", timestamp: parentTimestamp),
+            tokenCount(
+                timestamp: parentTimestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 1_000, cached: 900, output: 100)
+            ),
+        ]
+    )
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T10-00-00-pre-context-child.jsonl",
+        lines: [
+            sessionMeta(
+                id: "pre-context-child",
+                timestamp: childTimestamp,
+                source: ["subagent": ["thread_spawn": [:]]],
+                forkedFromID: "pre-context-parent"
+            ),
+            tokenCount(
+                timestamp: childTimestamp,
+                total: (input: 40, cached: 30, output: 10),
+                last: (input: 40, cached: 30, output: 10)
+            ),
+            turnContext(model: "gpt-5.6-sol", timestamp: "2026-07-18T10:01:00Z"),
+            tokenCount(
+                timestamp: "2026-07-18T10:02:00Z",
+                total: (input: 50, cached: 35, output: 15),
+                last: (input: 10, cached: 5, output: 5)
+            ),
+        ]
+    )
+
+    let cold = try fixture.scan(now: now, forceRescan: true)
+    #expect(cold.last30DaysTokens == 1_165)
+    #expect(cold.daily[0].modelBreakdowns == [
+        CodexUsageModelBreakdown(modelName: "gpt-5.6-sol", totalTokens: 1_115),
+        CodexUsageModelBreakdown(modelName: "unknown", totalTokens: 50),
+    ])
+    let warm = try fixture.scan(now: now.addingTimeInterval(61), forceRescan: false)
+    expectSameUsage(warm, cold)
+}
+
+@Test func recoverySubagentOwnedSuffixDropsCopiedPrefixWithoutParent() throws {
+    let fixture = try UsageFixture()
+    defer { fixture.remove() }
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+    let timestamp = "2026-07-18T10:00:00Z"
+
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T10-00-00-recovery-owned-suffix.jsonl",
+        lines: [
+            sessionMeta(
+                id: "recovery-owned-suffix",
+                timestamp: timestamp,
+                source: ["subagent": ["thread_spawn": [:]]],
+                forkedFromID: "missing-owned-suffix-parent"
+            ),
+            tokenCount(
+                timestamp: timestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 10, cached: 9, output: 1)
+            ),
+            tokenCount(
+                timestamp: "2026-07-18T10:01:00Z",
+                total: (input: 1_050, cached: 925, output: 105),
+                last: (input: 50, cached: 25, output: 5)
+            ),
+            turnContext(model: "gpt-5.6-sol", timestamp: "2026-07-18T10:02:00Z"),
+            jsonLine([
+                "timestamp": "2026-07-18T10:02:00Z",
+                "type": "inter_agent_communication_metadata",
+                "payload": ["trigger_turn": true],
+            ]),
+            tokenCount(
+                timestamp: "2026-07-18T10:03:00Z",
+                total: (input: 1_100, cached: 950, output: 110),
+                last: (input: 50, cached: 25, output: 5)
+            ),
+        ]
+    )
+
+    let cold = try fixture.scan(now: now, forceRescan: true)
+    #expect(cold.last30DaysTokens == 55)
+    #expect(cold.daily[0].modelBreakdowns == [
+        CodexUsageModelBreakdown(modelName: "gpt-5.6-sol", totalTokens: 55),
+    ])
+    let warm = try fixture.scan(now: now.addingTimeInterval(61), forceRescan: false)
+    expectSameUsage(warm, cold)
+}
+
+@Test func recoverySubagentWithMissingParentSkipsInheritedFirstSnapshot() throws {
+    let fixture = try UsageFixture()
+    defer { fixture.remove() }
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+    let timestamp = "2026-07-18T10:00:00Z"
+
+    try fixture.writeSession(
+        name: "rollout-2026-07-18T10-00-00-missing-recovery-parent.jsonl",
+        lines: [
+            sessionMeta(
+                id: "missing-recovery-parent-child",
+                timestamp: timestamp,
+                source: ["subagent": ["thread_spawn": [:]]],
+                forkedFromID: "missing-recovery-parent"
+            ),
+            tokenCount(
+                timestamp: timestamp,
+                total: (input: 1_000, cached: 900, output: 100),
+                last: (input: 10, cached: 9, output: 1)
+            ),
+            turnContext(model: "gpt-5.6-sol", timestamp: "2026-07-18T10:01:00Z"),
+            tokenCount(
+                timestamp: "2026-07-18T10:02:00Z",
+                total: (input: 1_100, cached: 950, output: 110),
+                last: (input: 100, cached: 50, output: 10)
+            ),
+        ]
+    )
+
+    let cold = try fixture.scan(now: now, forceRescan: true)
+    #expect(cold.last30DaysTokens == 110)
+    #expect(cold.daily[0].modelBreakdowns == [
+        CodexUsageModelBreakdown(modelName: "gpt-5.6-sol", totalTokens: 110),
+    ])
+    let warm = try fixture.scan(now: now.addingTimeInterval(61), forceRescan: false)
+    expectSameUsage(warm, cold)
+}
+
 @Test func activeAndArchivedCopiesOfOneSessionAreDeduplicated() throws {
     let fixture = try UsageFixture()
     defer { fixture.remove() }

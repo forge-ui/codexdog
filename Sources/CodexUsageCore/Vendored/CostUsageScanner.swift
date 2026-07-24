@@ -2507,7 +2507,8 @@ enum CostUsageScanner {
                 }
                 let shape = CodexSubagentRolloutShape.classify(
                     leafSessionID: sessionId,
-                    observations: observations)
+                    observations: observations,
+                    hasExplicitParent: forkedFromId != nil)
                 subagentCounterSemantics = shape.counterSemantics
                 if forkedFromId == nil {
                     forkedFromId = shape.inferredParentSessionID

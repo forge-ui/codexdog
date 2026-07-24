@@ -55,7 +55,8 @@ extension CostUsageScanner {
 
         static func classify(
             leafSessionID: String?,
-            observations: [Observation]) -> Self
+            observations: [Observation],
+            hasExplicitParent: Bool = false) -> Self
         {
             let metadataIDs = observations.reduce(into: [String?]()) { result, observation in
                 guard case let .sessionMetadata(id) = observation.kind else { return }
@@ -64,7 +65,18 @@ extension CostUsageScanner {
             let metadataShape = Self.classify(
                 leafSessionID: leafSessionID,
                 observedSessionIDs: metadataIDs)
-            guard metadataShape.counterSemantics == .copiedPrefix else { return metadataShape }
+            let hasCumulativeRecoveryPrefix = metadataShape.counterSemantics == .independent
+                && hasExplicitParent
+                && Self.hasInheritedCumulativePrefixBeforeFirstTurnContext(observations)
+            if metadataShape.counterSemantics == .independent, !hasCumulativeRecoveryPrefix {
+                return metadataShape
+            }
+            // Recovery rollouts can carry only the leaf metadata while replaying the parent's
+            // cumulative counter before their first model-bearing turn. `total > last` is the
+            // counter-level proof that the first snapshot did not start at zero. Route this shape
+            // through the parent baseline instead of charging the complete history to an
+            // unattributed model. Continue through suffix detection below so a strong local boundary
+            // can discard the replay even when the parent log is missing or changes while scanning.
 
             let normalizedLeafID = Self.normalizedSessionID(leafSessionID)
             var lastRawTotals: CostUsageCodexTotals?
@@ -136,6 +148,23 @@ extension CostUsageScanner {
                 counterSemantics: .copiedPrefix,
                 ownedSuffix: ownedSuffix,
                 inferredParentSessionID: metadataShape.inferredParentSessionID)
+        }
+
+        private static func hasInheritedCumulativePrefixBeforeFirstTurnContext(
+            _ observations: [Observation]) -> Bool
+        {
+            for observation in observations {
+                switch observation.kind {
+                case .turnContext:
+                    return false
+                case let .tokenCount(total, last):
+                    guard let total, let last else { return false }
+                    return Self.totalsAtLeast(total, last) && !Self.totalsEqual(total, last)
+                case .sessionMetadata, .interAgentCommunication:
+                    continue
+                }
+            }
+            return false
         }
 
         static func sameConcreteSessionID(_ lhs: String?, _ rhs: String?) -> Bool {
