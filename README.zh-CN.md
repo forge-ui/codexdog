@@ -6,7 +6,7 @@ CodexDog 是一款原生 macOS 菜单栏看门狗。当当前 ChatGPT Codex 账�
 
 应用安装后的名称为 `CodexDog.app`。
 
-<img src="docs/images/codexdog-menu.png" alt="CodexDog 菜单栏界面，展示多账号周额度、本机用量与自动切换" width="360">
+<img src="docs/images/codexdog-menu-v2.png" alt="CodexDog 菜单栏界面，展示多账号周额度、本机用量与自动切换" width="360">
 
 ## 功能
 

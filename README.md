@@ -6,7 +6,7 @@ A native macOS menu bar watchdog for switching between your ChatGPT Codex accoun
 
 The app is installed as `CodexDog.app`.
 
-<img src="docs/images/codexdog-menu.png" alt="CodexDog menu showing multiple accounts, weekly quota, local usage, and automatic switching" width="360">
+<img src="docs/images/codexdog-menu-v2.png" alt="CodexDog menu showing multiple accounts, weekly quota, local usage, and automatic switching" width="360">
 
 ## Features
 
