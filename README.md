@@ -1,5 +1,7 @@
 # CodexDog
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A native macOS menu bar watchdog for switching between your ChatGPT Codex accounts when the active account runs out of quota.
 
 The app is installed as `CodexDog.app`.
