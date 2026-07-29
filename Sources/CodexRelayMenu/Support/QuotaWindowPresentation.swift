@@ -93,6 +93,9 @@ enum QuotaWindowPresentation {
         guard let durationMinutes, durationMinutes > 0 else {
             return fallbackIndex.map { "官方额度 \($0)" } ?? "官方额度"
         }
+        if durationMinutes == 7 * 1_440 {
+            return "周额度"
+        }
         if durationMinutes.isMultiple(of: 1_440) {
             return "\(durationMinutes / 1_440) 天"
         }

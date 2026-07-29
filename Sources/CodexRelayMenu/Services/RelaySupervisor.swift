@@ -82,7 +82,7 @@ final class RelaySupervisor: @unchecked Sendable {
             lock.lock()
             starting = false
             lock.unlock()
-            throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "找不到 codex-relay helper"])
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "找不到 CodexDog helper"])
         }
 
         removeLegacyLaunchAgent(helper: helper)

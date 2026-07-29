@@ -48,9 +48,10 @@ func processDescendants(of parentPID: pid_t) -> [pid_t] {
 
 func usage() {
     print("""
-    CodexRelay 0.8.2
+    CodexDog 0.8.3
       codex-relay init
       codex-relay profile login <name>
+      codex-relay profile adopt <name>
       codex-relay profile import-current <name>
       codex-relay profile verify <name>
       codex-relay profile save <name>
@@ -131,26 +132,27 @@ do {
             defer { verification.stop() }
             let limits = try verification.rateLimits()
             operationLease = try advisoryLock.acquire()
-            try requireIdleSwitchTransaction(storage)
-            var updatedConfig = try storage.loadConfig()
-            if let duplicate = storage.duplicateProfile(for: name, among: updatedConfig.profiles) {
-                throw RelayError.verification("Profile \(name) is the same ChatGPT account as \(duplicate). Log in with a different account.")
-            }
-            if !updatedConfig.profiles.contains(name) {
-                updatedConfig.profiles.append(name)
-                try storage.saveConfig(updatedConfig)
-            }
             let sampledAt = Date()
-            try storage.updateAccountQuota(AccountQuotaStatus(
-                profile: name,
-                updatedAt: sampledAt,
-                primary: limits.primary,
-                secondary: limits.secondary,
-                planType: limits.planType,
-                error: nil,
-                lastAttemptAt: sampledAt
-            ))
+            try engine.enrollAuthenticatedProfile(
+                name,
+                limits: limits,
+                sampledAt: sampledAt
+            )
             print("Logged in \(name): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")")
+        case "adopt" where arguments.count == 3:
+            let name = arguments[2]
+            let profileHome = try storage.prepareProfileHome(name)
+            guard storage.profileExists(name) else {
+                throw RelayError.invalidProfile("Profile \(name) has not been saved")
+            }
+            let verification = try AppServerClient(
+                binaryPath: config.codexBinaryPath,
+                codexHome: profileHome
+            )
+            defer { verification.stop() }
+            let limits = try verification.rateLimits()
+            try engine.enrollAuthenticatedProfile(name, limits: limits)
+            print("Adopted saved profile \(name): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")")
         case "verify" where arguments.count == 3:
             let name = arguments[2]
             let profileHome = try storage.prepareProfileHome(name)
@@ -222,10 +224,10 @@ do {
             state.nextQuotaProfileIndex = nil
             try storage.saveState(state)
             try storage.deleteProfile(name)
-            print("Deleted \(name) from CodexRelay")
+            print("Deleted \(name) from CodexDog")
         default:
             throw RelayError.invalidArguments(
-                "Expected profile login/import-current/save/verify/disable/enable/delete <name>, or profile list")
+                "Expected profile login/adopt/import-current/save/verify/disable/enable/delete <name>, or profile list")
         }
     case "config" where arguments.count == 3 && arguments[1] == "auto-switch":
         var updatedConfig = try storage.loadConfig()

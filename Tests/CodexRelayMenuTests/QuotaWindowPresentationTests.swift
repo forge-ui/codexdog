@@ -44,7 +44,7 @@ import Testing
     #expect(!text.contains("删除"))
 }
 
-@Test func weeklyOnlyOfficialWindowIsPresentedAsSevenDays() {
+@Test func weeklyOnlyOfficialWindowIsPresentedAsWeeklyQuota() {
     let quota = MenuAccountQuota(
         profile: "account-a",
         updatedAt: Date(),
@@ -62,7 +62,7 @@ import Testing
     let rows = QuotaWindowPresentation.rows(for: quota)
 
     #expect(rows.count == 1)
-    #expect(rows.first?.title == "7 天")
+    #expect(rows.first?.title == "周额度")
     #expect(rows.first?.source == .primary)
 }
 
@@ -87,7 +87,7 @@ import Testing
 
     let rows = QuotaWindowPresentation.rows(for: quota)
 
-    #expect(rows.map(\.title) == ["5 小时", "7 天"])
+    #expect(rows.map(\.title) == ["5 小时", "周额度"])
     #expect(rows.map(\.source) == [.secondary, .primary])
 }
 

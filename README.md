@@ -2,7 +2,7 @@
 
 A native macOS menu bar watchdog for switching between your ChatGPT Codex accounts when the active account runs out of quota.
 
-The app is currently installed as `CodexRelay.app`.
+The app is installed as `CodexDog.app`.
 
 ## Features
 
@@ -27,11 +27,11 @@ cd codexdog
 ./script/build_and_run.sh --install
 ```
 
-The app is installed at `~/Applications/CodexRelay.app`. It runs only in the menu bar and does not stay in the Dock. Quitting the menu bar app also stops the watchdog.
+The app is installed at `~/Applications/CodexDog.app`. It runs only in the menu bar and does not stay in the Dock. Quitting the menu bar app also stops the watchdog.
 
 ## Use
 
-1. Open CodexRelay from the macOS menu bar.
+1. Open CodexDog from the macOS menu bar.
 2. Use the add-account button to import the account already signed in to Codex or log in with another account.
 3. Add as many accounts as needed.
 4. Enable **Automatic switching**.
@@ -42,7 +42,7 @@ Local token and cost estimates are calculated directly from local Codex session 
 scanner is derived from CodexBar v0.44.0 under the MIT License; see
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-Account credentials stay on this Mac under `~/Library/Application Support/CodexRelay` with owner-only permissions. Switching preserves `~/.codex` and replaces only the active `auth.json` credential.
+Account credentials stay on this Mac under the legacy-compatible `~/Library/Application Support/CodexRelay` data directory with owner-only permissions. Switching preserves `~/.codex` and replaces only the active `auth.json` credential.
 
 Task continuation is best effort because cross-account recovery is not an official OpenAI contract.
 

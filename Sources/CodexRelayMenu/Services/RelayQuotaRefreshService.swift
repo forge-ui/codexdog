@@ -9,7 +9,7 @@ enum RelayQuotaRefreshServiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .helperUnavailable:
-            return "找不到 codex-relay helper"
+            return "找不到 CodexDog helper"
         case .timedOut:
             return "官方额度刷新超时"
         case .commandFailed(let message):

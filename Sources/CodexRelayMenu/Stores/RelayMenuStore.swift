@@ -269,7 +269,7 @@ final class RelayMenuStore: ObservableObject {
 
     func setAutomaticSwitching(_ enabled: Bool) {
         guard !isRefreshBusy, !commandIsRunning else { return }
-        guard let helper = supervisor.helperPath() else { message = "找不到 codex-relay helper"; return }
+        guard let helper = supervisor.helperPath() else { message = "找不到 CodexDog helper"; return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: helper)
         process.arguments = ["config", "auto-switch", enabled ? "on" : "off"]
@@ -292,7 +292,7 @@ final class RelayMenuStore: ObservableObject {
         guard !isRefreshBusy else { return }
         guard commandProcess?.isRunning != true else { return }
         guard !name.isEmpty else { message = "请输入账号名称"; return }
-        guard let helper = supervisor.helperPath() else { message = "找不到 codex-relay helper"; return }
+        guard let helper = supervisor.helperPath() else { message = "找不到 CodexDog helper"; return }
 
         message = nil
         let workerWasRunning = supervisor.isRunning

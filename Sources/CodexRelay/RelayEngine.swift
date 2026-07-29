@@ -195,6 +195,43 @@ final class RelayEngine: @unchecked Sendable {
         return "Imported current ChatGPT account as \(requestedProfile): plan=\(limits.planType ?? "unknown") primary=\(limits.primary?.usedPercent.description ?? "n/a") secondary=\(limits.secondary?.usedPercent.description ?? "n/a")"
     }
 
+    func enrollAuthenticatedProfile(
+        _ profile: String,
+        limits: RateLimitSnapshot,
+        sampledAt: Date = Date()
+    ) throws {
+        try storage.validateProfileName(profile)
+        guard storage.profileExists(profile) else {
+            throw RelayError.invalidProfile("Profile \(profile) has not been saved")
+        }
+        guard limits.hasOfficialLimitSignal else {
+            throw RelayError.rpc("Missing official rate limit windows")
+        }
+
+        var updatedConfig = try storage.loadConfig()
+        if let duplicate = storage.duplicateProfile(
+            for: profile,
+            among: updatedConfig.profiles
+        ) {
+            throw RelayError.verification(
+                "Profile \(profile) is the same ChatGPT account as \(duplicate). Log in with a different account.")
+        }
+        if !updatedConfig.profiles.contains(profile) {
+            updatedConfig.profiles.append(profile)
+        }
+
+        try storage.updateAccountQuota(AccountQuotaStatus(
+            profile: profile,
+            updatedAt: sampledAt,
+            primary: limits.primary,
+            secondary: limits.secondary,
+            planType: limits.planType,
+            error: nil,
+            lastAttemptAt: sampledAt
+        ))
+        try storage.saveConfig(updatedConfig)
+    }
+
     func refreshAllQuotas() throws -> String {
         var state = try storage.loadState()
         guard state.pendingSwitch == nil else {
@@ -300,6 +337,11 @@ final class RelayEngine: @unchecked Sendable {
                now: now,
                minimumInterval: TimeInterval(config.pollIntervalSeconds))
         {
+            if let transaction = state.pendingSwitch,
+               transaction.phase == .validated || transaction.phase == .recovering
+            {
+                return try submitPendingRecovery(state: &state)
+            }
             try refreshStandbyQuotas(
                 state: &state,
                 activeProfile: active,
@@ -719,9 +761,11 @@ final class RelayEngine: @unchecked Sendable {
                     failed.remove(entry.recoveryKey)
                     state.completedRecoveryKeys.insert(entry.recoveryKey)
                     transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                    clearTransientRecoveryError(for: entry, state: &state)
                 case .inProgress:
                     failed.remove(entry.recoveryKey)
                     transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                    clearTransientRecoveryError(for: entry, state: &state)
                 case .absent, .terminalFailure, .unknown:
                     break
                 }
@@ -758,38 +802,52 @@ final class RelayEngine: @unchecked Sendable {
                 if existingStatus == .completed {
                     state.completedRecoveryKeys.insert(entry.recoveryKey)
                     transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                    clearTransientRecoveryError(for: entry, state: &state)
                     state.pendingSwitch = transaction
                     try storage.saveState(state)
                     continue
                 }
                 if existingStatus == .unknown {
-                    state.lastError = "Recovery marker status for \(entry.threadId) is unknown; will retry without submitting"
+                    if recordRecoveryProblem(
+                        for: entry,
+                        transaction: &transaction,
+                        state: &state
+                    ) {
+                        abandoned += 1
+                    }
                     state.pendingSwitch = transaction
                     try storage.saveState(state)
                     continue
                 }
                 if existingStatus == .inProgress {
                     watchedEntries.append(entry)
+                    clearTransientRecoveryError(for: entry, state: &state)
                     state.pendingSwitch = transaction
                     try storage.saveState(state)
                     continue
                 }
                 if existingStatus == .terminalFailure {
-                    let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
-                    transaction.recoveryAttempts[entry.recoveryKey] = attempts
-                    state.lastError = "Recovery turn \(entry.threadId) did not complete (\(attempts)/3)"
-                    if attempts >= 3 {
-                        var failed = state.failedRecoveryKeys ?? []
-                        failed.insert(entry.recoveryKey)
-                        state.failedRecoveryKeys = failed
-                        abandoned += 1
-                        state.pendingSwitch = transaction
-                        try storage.saveState(state)
-                        continue
+                    if transaction.recoveryAttempts[entry.recoveryKey] == nil {
+                        if recordRecoveryProblem(
+                            for: entry,
+                            transaction: &transaction,
+                            state: &state
+                        ) {
+                            abandoned += 1
+                            state.pendingSwitch = transaction
+                            try storage.saveState(state)
+                            continue
+                        }
                     }
                 }
             } catch {
-                state.lastError = "Recovery marker check for \(entry.threadId) will retry: \(error.localizedDescription)"
+                if recordRecoveryProblem(
+                    for: entry,
+                    transaction: &transaction,
+                    state: &state
+                ) {
+                    abandoned += 1
+                }
                 state.pendingSwitch = transaction
                 try storage.saveState(state)
                 continue
@@ -798,31 +856,43 @@ final class RelayEngine: @unchecked Sendable {
                 try client.resumeAndWake(entry)
                 submitted += 1
                 watchedEntries.append(entry)
+                clearTransientRecoveryError(for: entry, state: &state)
             } catch {
-                let wakeError = error
                 do {
                     switch try client.recoveryMarkerStatus(entry) {
                     case .completed:
                         state.completedRecoveryKeys.insert(entry.recoveryKey)
                         transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                        clearTransientRecoveryError(for: entry, state: &state)
                     case .inProgress:
                         submitted += 1
                         watchedEntries.append(entry)
+                        clearTransientRecoveryError(for: entry, state: &state)
                     case .absent, .terminalFailure:
-                        let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
-                        transaction.recoveryAttempts[entry.recoveryKey] = attempts
-                        state.lastError = "Wake \(entry.threadId) failed (\(attempts)/3): \(wakeError.localizedDescription)"
-                        if attempts >= 3 {
-                            var failed = state.failedRecoveryKeys ?? []
-                            failed.insert(entry.recoveryKey)
-                            state.failedRecoveryKeys = failed
+                        if recordRecoveryProblem(
+                            for: entry,
+                            transaction: &transaction,
+                            state: &state
+                        ) {
                             abandoned += 1
                         }
                     case .unknown:
-                        state.lastError = "Wake \(entry.threadId) had an ambiguous response; marker status is unknown"
+                        if recordRecoveryProblem(
+                            for: entry,
+                            transaction: &transaction,
+                            state: &state
+                        ) {
+                            abandoned += 1
+                        }
                     }
                 } catch {
-                    state.lastError = "Wake \(entry.threadId) had an ambiguous response; marker verification will retry: \(error.localizedDescription)"
+                    if recordRecoveryProblem(
+                        for: entry,
+                        transaction: &transaction,
+                        state: &state
+                    ) {
+                        abandoned += 1
+                    }
                 }
             }
             state.pendingSwitch = transaction
@@ -854,6 +924,46 @@ final class RelayEngine: @unchecked Sendable {
         return "submitted \(submitted) recovery turns, \(remaining) pending"
     }
 
+    private func terminalRecoveryError() -> String {
+        "有任务自动恢复失败（连续 3 次未完成），请在 ChatGPT 中手动继续"
+    }
+
+    @discardableResult
+    private func recordRecoveryProblem(
+        for entry: RecoveryEntry,
+        transaction: inout SwitchTransaction,
+        state: inout RelayState
+    ) -> Bool {
+        let attempts = (transaction.recoveryAttempts[entry.recoveryKey] ?? 0) + 1
+        transaction.recoveryAttempts[entry.recoveryKey] = attempts
+        guard attempts >= 3 else {
+            clearTransientRecoveryError(for: entry, state: &state)
+            return false
+        }
+        var failed = state.failedRecoveryKeys ?? []
+        failed.insert(entry.recoveryKey)
+        state.failedRecoveryKeys = failed
+        state.lastError = terminalRecoveryError()
+        return true
+    }
+
+    private func clearTransientRecoveryError(
+        for entry: RecoveryEntry,
+        state: inout RelayState
+    ) {
+        guard let error = state.lastError else { return }
+        let prefixes = [
+            "Recovery turn \(entry.threadId) did not complete (",
+            "Recovery marker status for \(entry.threadId) is unknown;",
+            "Recovery marker check for \(entry.threadId) will retry:",
+            "Wake \(entry.threadId) failed (",
+            "Wake \(entry.threadId) had an ambiguous response;",
+        ]
+        if prefixes.contains(where: error.hasPrefix) {
+            state.lastError = nil
+        }
+    }
+
     private var hasActiveRecoveryHosts: Bool {
         recoveryHostsLock.lock()
         let active = !recoveryHosts.isEmpty
@@ -868,13 +978,66 @@ final class RelayEngine: @unchecked Sendable {
         recoveryHostsLock.unlock()
 
         Thread.detachNewThread { [weak self] in
-            _ = client.waitForTurns(entries, timeoutSeconds: 21_600)
+            let completedThreadIDs = client.waitForTurns(
+                entries,
+                timeoutSeconds: 21_600
+            )
+            self?.recordRecoveryHostOutcome(
+                client: client,
+                entries: entries,
+                completedThreadIDs: completedThreadIDs
+            )
             client.stop()
             guard let self else { return }
             self.recoveryHostsLock.lock()
             self.recoveryHosts.removeValue(forKey: hostID)
             self.recoveryHostsLock.unlock()
         }
+    }
+
+    private func recordRecoveryHostOutcome(
+        client: any AppServerServing,
+        entries: [RecoveryEntry],
+        completedThreadIDs: Set<String>
+    ) {
+        guard var state = try? storage.loadState(),
+              var transaction = state.pendingSwitch
+        else { return }
+        let transactionKeys = Set(transaction.snapshot.threads.map(\.recoveryKey))
+        var changed = false
+
+        for entry in entries where transactionKeys.contains(entry.recoveryKey) {
+            guard !state.completedRecoveryKeys.contains(entry.recoveryKey),
+                  !(state.failedRecoveryKeys ?? []).contains(entry.recoveryKey)
+            else { continue }
+
+            let finalStatus: RecoveryMarkerStatus?
+            if completedThreadIDs.contains(entry.threadId) {
+                finalStatus = .completed
+            } else {
+                finalStatus = try? client.recoveryMarkerStatus(entry)
+            }
+            switch finalStatus {
+            case .completed:
+                state.completedRecoveryKeys.insert(entry.recoveryKey)
+                transaction.recoveryAttempts.removeValue(forKey: entry.recoveryKey)
+                clearTransientRecoveryError(for: entry, state: &state)
+                changed = true
+            case .inProgress:
+                break
+            case .absent, .terminalFailure, .unknown, nil:
+                _ = recordRecoveryProblem(
+                    for: entry,
+                    transaction: &transaction,
+                    state: &state
+                )
+                changed = true
+            }
+        }
+
+        guard changed else { return }
+        state.pendingSwitch = transaction
+        try? storage.saveState(state)
     }
 
     private func stopRecoveryHosts() {

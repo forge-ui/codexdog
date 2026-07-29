@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             expandedActionsProfile: showsActions ? previewProfile : nil,
             confirmingDeletionProfile: confirmsDeletion ? previewProfile : nil))
         let window = NSWindow(contentViewController: controller)
-        window.title = "CodexRelay 菜单预览"
+        window.title = "CodexDog 菜单预览"
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.center()

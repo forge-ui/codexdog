@@ -279,13 +279,19 @@ private struct AccountQuotaGroup: View {
             }
 
             if quotaRows.isEmpty {
-                QuotaProgressRow(title: "官方额度", window: nil, sampledAt: nil)
+                QuotaProgressRow(
+                    title: "官方额度",
+                    window: nil,
+                    sampledAt: nil,
+                    isActive: isActive
+                )
             } else {
                 ForEach(quotaRows) { row in
                     QuotaProgressRow(
                         title: row.title,
                         window: row.window,
-                        sampledAt: quota?.updatedAt
+                        sampledAt: quota?.updatedAt,
+                        isActive: isActive
                     )
                 }
             }
@@ -365,6 +371,7 @@ private struct QuotaProgressRow: View {
     let title: String
     let window: MenuQuotaWindow?
     let sampledAt: Date?
+    let isActive: Bool
 
     private var remaining: Int? {
         window.map { max(0, min(100, 100 - $0.usedPercent)) }
@@ -412,6 +419,7 @@ private struct QuotaProgressRow: View {
         guard let remaining else { return .secondary }
         if remaining <= 1 { return .red }
         if remaining <= 20 { return .orange }
+        if isActive { return Color(nsColor: .systemBlue) }
         return Color(nsColor: .secondaryLabelColor).opacity(0.82)
     }
 

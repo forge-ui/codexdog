@@ -39,6 +39,6 @@ struct WatchdogLogo: View {
                 .shadow(color: .black.opacity(0.22), radius: size * 0.05, y: size * 0.025)
         }
         .frame(width: size, height: size)
-        .accessibilityLabel("CodexRelay 看门狗")
+        .accessibilityLabel("CodexDog 看门狗")
     }
 }

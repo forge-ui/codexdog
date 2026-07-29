@@ -22,7 +22,7 @@ stage_app() {
 
 sign_app() {
   local app="$1"
-  local identity="${CODEXRELAY_SIGNING_IDENTITY:--}"
+  local identity="${CODEXDOG_SIGNING_IDENTITY:-${CODEXRELAY_SIGNING_IDENTITY:--}}"
   local -a flags=(--force --sign "$identity")
   if [[ "$identity" != "-" ]]; then
     flags+=(--options runtime --timestamp)
@@ -35,8 +35,8 @@ sign_app() {
 
 build_icon() {
   local output="$1"
-  local iconset="$PWD/.build/CodexRelay.iconset"
-  local master="$PWD/.build/CodexRelay-1024.png"
+  local iconset="$PWD/.build/CodexDog.iconset"
+  local master="$PWD/.build/CodexDog-1024.png"
   rm -rf "$iconset"
   mkdir -p "$iconset"
   /usr/bin/sips -s format png "Support/CodexRelayDogTwoAccounts.png" --out "$master" >/dev/null
@@ -55,6 +55,7 @@ launch_app() {
 
 stop_running_app() {
   local pid child deadline
+  local worker_pattern='/(CodexRelay|CodexDog)\.app/Contents/MacOS/codex-relay run --parent-pid'
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
     while IFS= read -r child; do
@@ -79,16 +80,16 @@ stop_running_app() {
     [[ -n "$pid" ]] || continue
     /bin/kill -TERM -- "-$pid" 2>/dev/null || true
     /bin/kill -TERM "$pid" 2>/dev/null || true
-  done < <(/usr/bin/pgrep -f '/CodexRelay.app/Contents/MacOS/codex-relay run --parent-pid' 2>/dev/null || true)
+  done < <(/usr/bin/pgrep -f "$worker_pattern" 2>/dev/null || true)
   deadline=$((SECONDS + 2))
-  while /usr/bin/pgrep -f '/CodexRelay.app/Contents/MacOS/codex-relay run --parent-pid' >/dev/null 2>&1 && (( SECONDS < deadline )); do
+  while /usr/bin/pgrep -f "$worker_pattern" >/dev/null 2>&1 && (( SECONDS < deadline )); do
     /bin/sleep 0.05
   done
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
     /bin/kill -KILL -- "-$pid" 2>/dev/null || true
     /bin/kill -KILL "$pid" 2>/dev/null || true
-  done < <(/usr/bin/pgrep -f '/CodexRelay.app/Contents/MacOS/codex-relay run --parent-pid' 2>/dev/null || true)
+  done < <(/usr/bin/pgrep -f "$worker_pattern" 2>/dev/null || true)
 }
 
 verify_running_app() {
@@ -108,15 +109,16 @@ verify_running_app() {
   [[ "$parent" == "$menu_pid" ]]
   version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
   build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-  [[ "$version" == "0.8.2" && "$build" == "14" ]]
-  echo "CodexRelay.app $version ($build) is running"
+  [[ "$version" == "0.8.3" && "$build" == "15" ]]
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist")" == "CodexDog" ]]
+  echo "CodexDog.app $version ($build) is running"
 }
 
 install_staged_app() {
   local staged="$1"
-  local destination="$HOME/Applications/CodexRelay.app"
-  local replacement="$HOME/Applications/.CodexRelay.app.new"
-  local backup="$HOME/Applications/.CodexRelay.app.previous"
+  local destination="$HOME/Applications/CodexDog.app"
+  local replacement="$HOME/Applications/.CodexDog.app.new"
+  local backup="$HOME/Applications/.CodexDog.app.previous"
   rm -rf "$replacement" "$backup"
   /usr/bin/ditto "$staged" "$replacement"
   if [[ -e "$destination" ]]; then
@@ -129,33 +131,39 @@ install_staged_app() {
   rm -rf "$backup"
 }
 
+remove_legacy_app() {
+  local legacy="$HOME/Applications/CodexRelay.app"
+  [[ ! -e "$legacy" ]] || rm -rf "$legacy"
+}
+
 case "${1:-}" in
   --test)
     swift test
     ;;
   --install)
     swift build -c release
-    stage_app release "$PWD/.build/CodexRelay.app"
+    stage_app release "$PWD/.build/CodexDog.app"
     stop_running_app
     mkdir -p "$HOME/Applications"
-    install_staged_app "$PWD/.build/CodexRelay.app"
+    install_staged_app "$PWD/.build/CodexDog.app"
     .build/release/codex-relay uninstall || true
-    launch_app "$HOME/Applications/CodexRelay.app"
+    launch_app "$HOME/Applications/CodexDog.app"
     sleep 2
-    verify_running_app "$HOME/Applications/CodexRelay.app"
+    verify_running_app "$HOME/Applications/CodexDog.app"
+    remove_legacy_app
     ;;
   --verify)
     swift build
-    stage_app debug "$PWD/dist/CodexRelay.app"
+    stage_app debug "$PWD/dist/CodexDog.app"
     stop_running_app
-    launch_app "$PWD/dist/CodexRelay.app"
+    launch_app "$PWD/dist/CodexDog.app"
     sleep 2
-    verify_running_app "$PWD/dist/CodexRelay.app"
+    verify_running_app "$PWD/dist/CodexDog.app"
     ;;
   *)
     swift build
-    stage_app debug "$PWD/dist/CodexRelay.app"
+    stage_app debug "$PWD/dist/CodexDog.app"
     stop_running_app
-    launch_app "$PWD/dist/CodexRelay.app"
+    launch_app "$PWD/dist/CodexDog.app"
     ;;
 esac

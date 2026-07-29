@@ -124,8 +124,12 @@ private final class FakeAppServer: AppServerServing, @unchecked Sendable {
                 backend.recoveryMarkers[key] = resultStatus
             }
         }
+        let completed = Set(entries.compactMap { entry in
+            backend.recoveryMarkers[entry.recoveryKey] == .completed
+                ? entry.threadId : nil
+        })
         backend.markerLock.unlock()
-        return Set(entries.map(\.threadId))
+        return completed
     }
 }
 
@@ -761,12 +765,52 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     let paused = try harness.storage.loadState()
 
     #expect(paused.pendingSwitch?.phase == .recovering)
+    #expect(paused.lastError == nil)
     #expect(harness.backend.wakeAttempts.isEmpty)
 
     _ = try harness.engine.checkOnce()
     try finishRecovery(harness)
     #expect(try harness.storage.loadState().pendingSwitch == nil)
     #expect(harness.backend.wakeAttempts.count == 1)
+}
+
+@Test func threeMarkerReadFailuresStopRecoveryWithAnActionableWarning() throws {
+    let harness = try makeEngineHarness(activeProfile: "b", activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let entry = RecoveryEntry(
+        threadId: "unreadable-recovery-thread",
+        cwd: "/tmp",
+        previousStatus: "active",
+        recoveryKey: "unreadable-recovery-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(),
+            createdAt: Date(),
+            sourceProfile: "a",
+            targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil
+    )
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        pendingSwitch: transaction
+    ))
+    harness.backend.markerReadFailuresRemaining = 3
+
+    for _ in 0..<3 {
+        _ = try harness.engine.checkOnce()
+    }
+    let state = try harness.storage.loadState()
+
+    #expect(state.pendingSwitch == nil)
+    #expect(state.failedRecoveryKeys?.contains(entry.recoveryKey) == true)
+    #expect(state.lastError?.contains("连续 3 次") == true)
+    #expect(harness.backend.wakeAttempts.isEmpty)
 }
 
 @Test func inProgressRecoveryTurnIsObservedWithoutDuplicateSubmissionOrFailure() throws {
@@ -860,6 +904,128 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     #expect(retried.failedRecoveryKeys?.contains(entry.recoveryKey) != true)
 }
 
+@Test func pendingRecoveryRunsEvenWhenActiveQuotaPollingIsNotDue() throws {
+    let harness = try makeEngineHarness(activeProfile: "b", activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.waitResultStatus = nil
+    let sampledAt = Date(timeIntervalSince1970: 2_000_000_000)
+    let entry = RecoveryEntry(
+        threadId: "scheduled-recovery-thread",
+        cwd: "/tmp",
+        previousStatus: "active",
+        recoveryKey: "scheduled-recovery-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(),
+            createdAt: sampledAt,
+            sourceProfile: "a",
+            targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil
+    )
+    try harness.storage.updateAccountQuota(AccountQuotaStatus(
+        profile: "b",
+        updatedAt: sampledAt,
+        primary: .init(usedPercent: 10, resetsAt: nil),
+        secondary: nil,
+        planType: "pro",
+        error: nil,
+        lastAttemptAt: sampledAt
+    ))
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        pendingSwitch: transaction
+    ))
+
+    let result = try harness.engine.checkOnce(
+        now: sampledAt.addingTimeInterval(1),
+        respectingSchedule: true
+    )
+
+    #expect(result.contains("submitted 1 recovery turns"))
+    #expect(harness.backend.wakeAttempts == [entry.recoveryKey])
+}
+
+@Test func transientTerminalRecoveryRetryDoesNotRemainVisibleAsWarning() throws {
+    let harness = try makeEngineHarness(activeProfile: "b", activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.waitResultStatus = nil
+    let entry = RecoveryEntry(
+        threadId: "retrying-recovery-thread",
+        cwd: "/tmp",
+        previousStatus: "active",
+        recoveryKey: "retrying-recovery-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(),
+            createdAt: Date(),
+            sourceProfile: "a",
+            targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil
+    )
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        pendingSwitch: transaction
+    ))
+    harness.backend.recoveryMarkers[entry.recoveryKey] = .terminalFailure
+
+    _ = try harness.engine.checkOnce()
+    let state = try harness.storage.loadState()
+
+    #expect(state.pendingSwitch?.recoveryAttempts[entry.recoveryKey] == 1)
+    #expect(state.lastError == nil)
+    #expect(harness.backend.wakeAttempts == [entry.recoveryKey])
+}
+
+@Test func inProgressRecoveryClearsALegacyTransientWarning() throws {
+    let harness = try makeEngineHarness(activeProfile: "b", activeUsedPercent: 10)
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.waitResultStatus = nil
+    let entry = RecoveryEntry(
+        threadId: "legacy-warning-thread",
+        cwd: "/tmp",
+        previousStatus: "active",
+        recoveryKey: "legacy-warning-key"
+    )
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: UUID(),
+            createdAt: Date(),
+            sourceProfile: "a",
+            targetProfile: "b",
+            threads: [entry]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil,
+        recoveryAttempts: [entry.recoveryKey: 1]
+    )
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        lastError: "Recovery turn \(entry.threadId) did not complete (1/3)",
+        pendingSwitch: transaction
+    ))
+    harness.backend.recoveryMarkers[entry.recoveryKey] = .inProgress
+
+    _ = try harness.engine.checkOnce()
+    let state = try harness.storage.loadState()
+
+    #expect(state.lastError == nil)
+    #expect(harness.backend.wakeAttempts.isEmpty)
+}
+
 @Test func threeTerminalRecoveryTurnsAreRecordedAsFailedAndStopRetrying() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
@@ -877,6 +1043,27 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     #expect(state.failedRecoveryKeys?.count == 1)
     #expect(state.completedRecoveryKeys.isEmpty)
     #expect(harness.backend.wakeAttempts.count == 3)
+    #expect(state.lastError?.contains("连续 3 次") == true)
+}
+
+@Test func acceptedRecoveryWithoutAPersistedMarkerStopsAfterThreeAttempts() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    harness.backend.waitResultStatus = .absent
+
+    _ = try harness.engine.checkOnce()
+    for _ in 0..<100 {
+        Thread.sleep(forTimeInterval: 0.01)
+        _ = try harness.engine.checkOnce()
+        if try harness.storage.loadState().pendingSwitch == nil { break }
+    }
+    let state = try harness.storage.loadState()
+
+    #expect(state.pendingSwitch == nil)
+    #expect(state.failedRecoveryKeys?.count == 1)
+    #expect(state.completedRecoveryKeys.isEmpty)
+    #expect(harness.backend.wakeAttempts.count == 3)
+    #expect(state.lastError?.contains("连续 3 次") == true)
 }
 
 @Test func candidateWithoutOfficialQuotaWindowsIsNeverActivated() throws {
@@ -890,6 +1077,90 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     }
     #expect(try harness.storage.activeAccountID() == "account-a")
     #expect(try harness.storage.loadState().pendingSwitch == nil)
+}
+
+@Test func independentProfileEnrollmentCanFinishWhileRecoveryIsPending() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let profile = "c"
+    let profileHome = try harness.storage.prepareProfileHome(profile)
+    try engineTestAuth(accountID: "account-c", token: "c-token")
+        .write(to: profileHome.appendingPathComponent("auth.json"), options: .atomic)
+    let switchID = UUID()
+    let transaction = SwitchTransaction(
+        snapshot: SwitchSnapshot(
+            id: switchID,
+            createdAt: Date(),
+            sourceProfile: "a",
+            targetProfile: "b",
+            threads: [RecoveryEntry(
+                threadId: "still-running-thread",
+                cwd: "/tmp",
+                previousStatus: "active",
+                recoveryKey: "still-running-recovery"
+            )]
+        ),
+        phase: .recovering,
+        sourceAccountID: "account-a",
+        targetAccountID: "account-b",
+        previousLastSwitchAt: nil
+    )
+    try harness.storage.saveState(RelayState(
+        activeProfile: "b",
+        pendingSwitch: transaction
+    ))
+    let activeAuthBefore = try Data(contentsOf: harness.storage.paths.activeAuth)
+    let sampledAt = Date(timeIntervalSince1970: 1_750_000_000)
+    let limits = RateLimitSnapshot(
+        primary: .init(usedPercent: 12, resetsAt: nil),
+        secondary: .init(usedPercent: 34, resetsAt: nil),
+        reachedReason: nil,
+        planType: "pro"
+    )
+
+    try harness.engine.enrollAuthenticatedProfile(
+        profile,
+        limits: limits,
+        sampledAt: sampledAt
+    )
+
+    let config = try harness.storage.loadConfig()
+    let state = try harness.storage.loadState()
+    let quota = try harness.storage.accountQuotaStatus(for: profile)
+    #expect(config.profiles == ["a", "b", "c"])
+    #expect(state.activeProfile == "b")
+    #expect(state.pendingSwitch?.snapshot.id == switchID)
+    #expect(state.pendingSwitch?.snapshot.threads == transaction.snapshot.threads)
+    #expect(state.pendingSwitch?.phase == .recovering)
+    #expect(state.pendingSwitch?.sourceAccountID == "account-a")
+    #expect(state.pendingSwitch?.targetAccountID == "account-b")
+    #expect(state.pendingSwitch?.recoveryAttempts.isEmpty == true)
+    #expect(try Data(contentsOf: harness.storage.paths.activeAuth) == activeAuthBefore)
+    #expect(quota?.updatedAt == sampledAt)
+    #expect(quota?.primary == limits.primary)
+    #expect(quota?.secondary == limits.secondary)
+}
+
+@Test func independentProfileEnrollmentStillRejectsADuplicateAccount() throws {
+    let harness = try makeEngineHarness()
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    let profile = "duplicate-a"
+    let profileHome = try harness.storage.prepareProfileHome(profile)
+    try engineTestAuth(accountID: "account-a", token: "other-a-token")
+        .write(to: profileHome.appendingPathComponent("auth.json"), options: .atomic)
+    let limits = RateLimitSnapshot(
+        primary: .init(usedPercent: 12, resetsAt: nil),
+        secondary: nil,
+        reachedReason: nil,
+        planType: "pro"
+    )
+
+    #expect(throws: RelayError.self) {
+        try harness.engine.enrollAuthenticatedProfile(profile, limits: limits)
+    }
+
+    #expect(try harness.storage.loadConfig().profiles == ["a", "b"])
+    #expect(try harness.storage.accountQuotaStatus(for: profile) == nil)
 }
 
 private func engineTestAuth(accountID: String, token: String) -> Data {
