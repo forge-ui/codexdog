@@ -383,11 +383,20 @@ private struct QuotaProgressRow: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            ProgressView(value: Double(remaining ?? 0), total: 100)
-                .progressViewStyle(.linear)
-                .tint(progressTint)
-                .controlSize(.mini)
-                .scaleEffect(x: 1, y: 0.48, anchor: .center)
+            GeometryReader { geometry in
+                let fraction = CGFloat(remaining ?? 0) / 100
+                let filledWidth = fraction > 0
+                    ? max(3, geometry.size.width * fraction)
+                    : 3
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color(nsColor: .separatorColor).opacity(0.5))
+                    Capsule()
+                        .fill(progressTint)
+                        .frame(width: min(geometry.size.width, filledWidth))
+                }
+            }
+            .frame(height: 3)
 
             HStack(alignment: .firstTextBaseline) {
                 Text(remaining.map { "\($0)% 剩余" } ?? "等待同步")
@@ -416,11 +425,16 @@ private struct QuotaProgressRow: View {
     }
 
     private var progressTint: Color {
-        guard let remaining else { return .secondary }
-        if remaining <= 1 { return .red }
-        if remaining <= 20 { return .orange }
-        if isActive { return Color(nsColor: .systemBlue) }
-        return Color(nsColor: .secondaryLabelColor).opacity(0.82)
+        switch QuotaProgressPresentation.tone(remaining: remaining, isActive: isActive) {
+        case .critical:
+            .red
+        case .warning:
+            .orange
+        case .active:
+            Color(nsColor: .systemBlue)
+        case .neutral:
+            Color(nsColor: .secondaryLabelColor).opacity(0.82)
+        }
     }
 
     private var resetDescription: String {
