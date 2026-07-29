@@ -109,7 +109,7 @@ verify_running_app() {
   [[ "$parent" == "$menu_pid" ]]
   version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
   build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-  [[ "$version" == "0.8.3" && "$build" == "15" ]]
+  [[ "$version" == "0.8.4" && "$build" == "16" ]]
   [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist")" == "CodexDog" ]]
   echo "CodexDog.app $version ($build) is running"
 }

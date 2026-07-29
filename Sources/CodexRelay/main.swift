@@ -48,7 +48,7 @@ func processDescendants(of parentPID: pid_t) -> [pid_t] {
 
 func usage() {
     print("""
-    CodexDog 0.8.3
+    CodexDog 0.8.4
       codex-relay init
       codex-relay profile login <name>
       codex-relay profile adopt <name>

@@ -301,6 +301,7 @@ final class RelayEngine: @unchecked Sendable {
         ))
 
         if failures.isEmpty {
+            clearTransientQuotaError(state: &state)
             try storage.saveState(state)
             return "Refreshed \(orderedProfiles.count) profiles: \(summary)"
         }
@@ -311,6 +312,13 @@ final class RelayEngine: @unchecked Sendable {
 
     private func shouldPersistActiveCredential(after error: Error) -> Bool {
         !isAuthenticationFailure(error)
+    }
+
+    private func clearTransientQuotaError(state: inout RelayState) {
+        guard state.lastError?.hasPrefix("failed to fetch codex rate limits:") == true else {
+            return
+        }
+        state.lastError = nil
     }
 
     func checkOnce(

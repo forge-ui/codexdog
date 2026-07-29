@@ -307,6 +307,9 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
 @Test func manualQuotaRefreshUpdatesEveryProfileWithoutForcingASwitch() throws {
     let harness = try makeEngineHarness()
     defer { try? FileManager.default.removeItem(at: harness.root) }
+    var staleState = try harness.storage.loadState()
+    staleState.lastError = "failed to fetch codex rate limits: temporary network failure"
+    try harness.storage.saveState(staleState)
 
     let result = try harness.engine.refreshAllQuotas()
     let quotas = try loadAccountQuotas(harness.storage)
@@ -315,6 +318,7 @@ private func loadAccountQuotas(_ storage: RelayStorage) throws -> AccountQuotaCo
     #expect(try harness.storage.activeAccountID() == "account-a")
     #expect(try harness.storage.loadState().activeProfile == "a")
     #expect(try harness.storage.loadState().lastSwitchAt == nil)
+    #expect(try harness.storage.loadState().lastError == nil)
     #expect(harness.app.quitCount == 0)
     #expect(harness.app.openCount == 0)
     #expect(harness.backend.rateLimitCalls == ["account-a": 1, "account-b": 1])
